@@ -1,8 +1,8 @@
 """Post-Call Hooks
 
-Sends call summary to n8n webhook after each call ends.
+Sends enriched call data to n8n webhook after each call ends.
 n8n can then trigger automations: email brief, Telegram notification,
-Google Sheet log, lead creation, etc.
+Google Sheet log, lead creation, handoff alerts, etc.
 """
 
 import os
@@ -13,11 +13,17 @@ from loguru import logger
 N8N_CALL_HOOK_URL = os.getenv("N8N_CALL_HOOK_URL", "")
 
 
-async def send_call_summary(call_metadata: dict):
-    """Send call summary to n8n after a call ends.
+async def send_call_summary(call_data: dict):
+    """Send enriched call data to n8n after a call ends.
 
     Args:
-        call_metadata: Dict with call info (connected_at, disconnected_at, etc.)
+        call_data: Dict with full call info including:
+            - call_id, caller_phone, caller_name
+            - connected_at, disconnected_at, duration_seconds
+            - transcript (list of {role, content} dicts)
+            - handoff_requested (bool), handoff_reason (str)
+            - topics (list of strings)
+            - recording_path (str)
     """
     if not N8N_CALL_HOOK_URL:
         logger.debug("N8N_CALL_HOOK_URL not set, skipping call summary hook")
@@ -25,15 +31,34 @@ async def send_call_summary(call_metadata: dict):
 
     payload = {
         "event": "call_ended",
-        "connected_at": call_metadata.get("connected_at"),
-        "disconnected_at": call_metadata.get("disconnected_at"),
+        "call_id": call_data.get("call_id", ""),
+        "caller": {
+            "phone": call_data.get("caller_phone", ""),
+            "name": call_data.get("caller_name", ""),
+        },
+        "timing": {
+            "connected_at": call_data.get("connected_at"),
+            "disconnected_at": call_data.get("disconnected_at"),
+            "duration_seconds": call_data.get("duration_seconds", 0),
+        },
+        "transcript": call_data.get("transcript", []),
+        "handoff": {
+            "requested": call_data.get("handoff_requested", False),
+            "reason": call_data.get("handoff_reason", ""),
+        },
+        "topics": call_data.get("topics", []),
+        "recording_path": call_data.get("recording_path", ""),
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(N8N_CALL_HOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post(
+                N8N_CALL_HOOK_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
                 if resp.status == 200:
-                    logger.info(f"Call summary sent to n8n: {resp.status}")
+                    logger.info(f"Call summary sent to n8n: call_id={call_data.get('call_id')}")
                 else:
                     body = await resp.text()
                     logger.warning(f"n8n hook returned {resp.status}: {body}")

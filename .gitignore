@@ -26,6 +26,13 @@ Thumbs.db
 # Logs
 *.log
 
+# Call recordings (large audio files)
+recordings/
+
+# SQLite database
+data/
+*.db
+
 # Distribution
 dist/
 build/

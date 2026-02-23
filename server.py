@@ -24,6 +24,7 @@ from pipecat.transports.whatsapp.api import WhatsAppWebhookRequest
 from pipecat.transports.whatsapp.client import WhatsAppClient
 
 from bot import run_bot
+from db import get_call, get_recent_calls, init_db
 from knowledge import load_knowledge
 
 load_dotenv(override=True)
@@ -58,6 +59,9 @@ def signal_handler():
 async def lifespan(app: FastAPI):
     global whatsapp_client, knowledge_context
 
+    # Initialize database
+    await init_db()
+
     # Load knowledge docs at startup
     knowledge_context = load_knowledge()
     logger.info(f"Knowledge loaded: {len(knowledge_context)} characters")
@@ -77,7 +81,7 @@ async def lifespan(app: FastAPI):
             logger.info("Cleanup done")
 
 
-app = FastAPI(title="IFS WhatsApp AI Voice Agent", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="IFS WhatsApp AI Voice Agent", version="2.0.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -107,13 +111,35 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
 
     logger.info(f"Webhook received: {body.dict()}")
 
+    # Extract caller info from webhook payload
+    caller_phone = ""
+    caller_name = ""
+    try:
+        for entry in body.entry:
+            for change in entry.changes:
+                value = change.value
+                if hasattr(value, "contacts") and value.contacts:
+                    contact = value.contacts[0]
+                    caller_phone = contact.wa_id
+                    if hasattr(contact, "profile") and contact.profile:
+                        caller_name = contact.profile.name
+                    break
+            if caller_phone:
+                break
+    except Exception as e:
+        logger.warning(f"Could not extract caller info: {e}")
+
+    logger.info(f"Caller: {caller_phone} ({caller_name})")
+
     # Reload knowledge on each call (allows updating docs without restart)
     current_knowledge = load_knowledge()
 
     async def connection_callback(connection: SmallWebRTCConnection):
         try:
             logger.info(f"Auto-accepted call, starting AI bot: {connection.pc_id}")
-            background_tasks.add_task(run_bot, connection, current_knowledge)
+            background_tasks.add_task(
+                run_bot, connection, current_knowledge, caller_phone, caller_name
+            )
         except Exception as e:
             logger.error(f"Failed to start bot: {e}")
             try:
@@ -132,10 +158,29 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
         raise HTTPException(status_code=500, detail="Internal error")
 
 
+# --- Call History API ---
+
+
+@app.get("/calls")
+async def list_calls(limit: int = 50):
+    """List recent calls for monitoring/dashboard."""
+    calls = await get_recent_calls(limit)
+    return {"calls": calls, "count": len(calls)}
+
+
+@app.get("/calls/{call_id}")
+async def get_call_detail(call_id: str):
+    """Get details for a specific call including transcript."""
+    call = await get_call(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return call
+
+
 @app.get("/health")
 async def health():
     """Health check for Coolify."""
-    return {"status": "ok", "service": "ifs-voice-agent"}
+    return {"status": "ok", "service": "ifs-voice-agent", "version": "2.0.0"}
 
 
 async def run_server(host: str, port: int):
