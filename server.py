@@ -1,9 +1,10 @@
 """IFS WhatsApp AI Voice Agent + Text Chatbot Server
 
 FastAPI server that:
-- Auto-accepts incoming WhatsApp calls → Gemini Live AI voice agent
-- Handles incoming WhatsApp text messages → GPT-4o text chatbot
-- Serves a dashboard for monitoring calls and chats
+- Auto-accepts incoming WhatsApp calls -> Gemini Live AI voice agent
+- Handles incoming WhatsApp text messages -> GPT-4o text chatbot
+- Serves a password-protected dashboard for monitoring calls and chats
+- Provides a knowledge file editor for managing AI knowledge base
 
 Receives webhooks forwarded from n8n, handles WebRTC via aiortc,
 and posts call/chat summaries back to n8n for automation.
@@ -11,17 +12,28 @@ and posts call/chat summaries back to n8n for automation.
 
 import argparse
 import asyncio
+import os
+import re
+import secrets
 import signal
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi import (
+    BackgroundTasks,
+    Cookie,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+)
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -36,17 +48,21 @@ from chat_db import (
 )
 from chatbot import handle_text_message
 from db import get_call, get_recent_calls, get_stats, init_db, resolve_call
-from knowledge import load_knowledge
+from knowledge import KNOWLEDGE_DIR, load_knowledge
 
 load_dotenv(override=True)
-import os
 
 # Config
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
-WHATSAPP_WEBHOOK_VERIFICATION_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFICATION_TOKEN", "ifs_verify")
+WHATSAPP_WEBHOOK_VERIFICATION_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFICATION_TOKEN", "")
 PORT = int(os.getenv("PORT", "7860"))
+
+# Security config
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+SESSION_EXPIRY_HOURS = 24
 
 if not all([WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID]):
     missing = [v for v, val in [
@@ -55,16 +71,76 @@ if not all([WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID]):
     ] if not val]
     raise ValueError(f"Missing required env vars: {', '.join(missing)}")
 
+if not WHATSAPP_WEBHOOK_VERIFICATION_TOKEN:
+    logger.warning("WHATSAPP_WEBHOOK_VERIFICATION_TOKEN not set — webhook verification may fail")
+
+if not DASHBOARD_PASSWORD:
+    logger.warning("DASHBOARD_PASSWORD not set — dashboard auth is DISABLED (dev mode)")
+
 # Ensure directories exist
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(exist_ok=True)
+KNOWLEDGE_DIR.mkdir(exist_ok=True)
 
 # Global state
 whatsapp_client: Optional[WhatsAppClient] = None
 shutdown_event = asyncio.Event()
 knowledge_context = ""
+
+# In-memory session store: {token: expiry_datetime}
+active_sessions: dict[str, datetime] = {}
+
+
+# --- Auth helpers ---
+
+
+def create_session() -> str:
+    """Create a new session token and store it."""
+    token = secrets.token_urlsafe(32)
+    active_sessions[token] = datetime.now(timezone.utc) + timedelta(hours=SESSION_EXPIRY_HOURS)
+    # Clean expired sessions
+    now = datetime.now(timezone.utc)
+    expired = [t for t, exp in active_sessions.items() if exp < now]
+    for t in expired:
+        del active_sessions[t]
+    return token
+
+
+def verify_session(token: str) -> bool:
+    """Check if a session token is valid and not expired."""
+    if not token or token not in active_sessions:
+        return False
+    if active_sessions[token] < datetime.now(timezone.utc):
+        del active_sessions[token]
+        return False
+    return True
+
+
+async def require_auth(session_token: str = Cookie(default="")):
+    """FastAPI dependency that requires a valid session cookie.
+
+    If DASHBOARD_PASSWORD is not set, auth is disabled (dev mode).
+    """
+    if not DASHBOARD_PASSWORD:
+        return  # Auth disabled in dev mode
+    if not verify_session(session_token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# --- Knowledge file helpers ---
+
+
+def validate_knowledge_filename(filename: str) -> str:
+    """Validate and sanitize a knowledge filename. Returns sanitized name."""
+    if not filename.endswith(".md"):
+        raise HTTPException(status_code=400, detail="Filename must end with .md")
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not re.match(r'^[a-zA-Z0-9_\-]+\.md$', filename):
+        raise HTTPException(status_code=400, detail="Filename can only contain letters, numbers, hyphens, and underscores")
+    return filename
 
 
 def signal_handler():
@@ -98,14 +174,66 @@ async def lifespan(app: FastAPI):
             logger.info("Cleanup done")
 
 
-app = FastAPI(title="IFS WhatsApp AI Voice Agent", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="IFS WhatsApp AI Voice Agent", version="3.1.0", lifespan=lifespan)
 
-# Mount static files for dashboard and recordings
+# Mount static files for dashboard (login page is always accessible,
+# but dashboard.html checks auth via JS)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-app.mount("/recordings", StaticFiles(directory=str(RECORDINGS_DIR)), name="recordings")
 
 
-# --- WhatsApp Voice Call Webhooks (existing) ---
+# --- Auth Endpoints (no auth required) ---
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    """Login with dashboard password. Sets session cookie."""
+    if not DASHBOARD_PASSWORD:
+        return JSONResponse({"status": "ok", "message": "Auth disabled"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    password = body.get("password", "")
+    if password != DASHBOARD_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    token = create_session()
+    response = JSONResponse({"status": "ok"})
+    response.set_cookie(
+        key="session_token",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=SESSION_EXPIRY_HOURS * 3600,
+    )
+    logger.info("Dashboard login successful")
+    return response
+
+
+@app.post("/auth/logout")
+async def auth_logout(session_token: str = Cookie(default="")):
+    """Logout and clear session."""
+    if session_token in active_sessions:
+        del active_sessions[session_token]
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie("session_token")
+    return response
+
+
+@app.get("/auth/check")
+async def auth_check(session_token: str = Cookie(default="")):
+    """Check if current session is valid."""
+    if not DASHBOARD_PASSWORD:
+        return {"authenticated": True, "auth_required": False}
+    if verify_session(session_token):
+        return {"authenticated": True, "auth_required": True}
+    return JSONResponse({"authenticated": False, "auth_required": True}, status_code=401)
+
+
+# --- WhatsApp Voice Call Webhooks (no auth — must be open for WhatsApp) ---
 
 
 @app.get("/")
@@ -182,22 +310,29 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
         raise HTTPException(status_code=500, detail="Internal error")
 
 
-# --- WhatsApp Text Message Webhook ---
+# --- WhatsApp Text Message Webhook (validated by secret, not session auth) ---
 
 
 @app.post("/webhook/text")
 async def handle_text_webhook(request: Request, background_tasks: BackgroundTasks):
     """Handle incoming WhatsApp text message webhooks from n8n.
 
-    Expects the raw WhatsApp webhook JSON body (not Pipecat's format).
-    Extracts sender phone, name, message text, and spawns chatbot handler.
+    Validates WEBHOOK_SECRET if configured. Expects raw WhatsApp webhook JSON.
     """
+    # Validate webhook secret if configured
+    if WEBHOOK_SECRET:
+        header_secret = request.headers.get("X-Webhook-Secret", "")
+        query_secret = request.query_params.get("secret", "")
+        if header_secret != WEBHOOK_SECRET and query_secret != WEBHOOK_SECRET:
+            logger.warning("Text webhook rejected: invalid secret")
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    logger.info(f"Text webhook received")
+    logger.info("Text webhook received")
 
     # Extract sender info and message from WhatsApp webhook format
     sender_phone = ""
@@ -258,17 +393,17 @@ async def handle_text_webhook(request: Request, background_tasks: BackgroundTask
     return {"status": "success"}
 
 
-# --- Call History API ---
+# --- Protected: Call History API ---
 
 
-@app.get("/calls")
+@app.get("/calls", dependencies=[Depends(require_auth)])
 async def list_calls(limit: int = 50):
     """List recent calls for monitoring/dashboard."""
     calls = await get_recent_calls(limit)
     return {"calls": calls, "count": len(calls)}
 
 
-@app.get("/calls/{call_id}")
+@app.get("/calls/{call_id}", dependencies=[Depends(require_auth)])
 async def get_call_detail(call_id: str):
     """Get details for a specific call including transcript."""
     call = await get_call(call_id)
@@ -277,17 +412,17 @@ async def get_call_detail(call_id: str):
     return call
 
 
-# --- Conversation API ---
+# --- Protected: Conversation API ---
 
 
-@app.get("/api/conversations")
+@app.get("/api/conversations", dependencies=[Depends(require_auth)])
 async def list_conversations(limit: int = 50):
     """List recent text conversations."""
     conversations = await get_recent_conversations(limit)
     return {"conversations": conversations, "count": len(conversations)}
 
 
-@app.get("/api/conversations/{conversation_id}")
+@app.get("/api/conversations/{conversation_id}", dependencies=[Depends(require_auth)])
 async def get_conversation_detail(conversation_id: str):
     """Get conversation detail with all messages."""
     conv = await get_conversation(conversation_id)
@@ -296,10 +431,10 @@ async def get_conversation_detail(conversation_id: str):
     return conv
 
 
-# --- Resolve Handoffs ---
+# --- Protected: Resolve Handoffs ---
 
 
-@app.patch("/api/calls/{call_id}/resolve")
+@app.patch("/api/calls/{call_id}/resolve", dependencies=[Depends(require_auth)])
 async def resolve_call_handoff(call_id: str):
     """Mark a call handoff as resolved."""
     call = await get_call(call_id)
@@ -309,7 +444,7 @@ async def resolve_call_handoff(call_id: str):
     return {"status": "resolved", "call_id": call_id}
 
 
-@app.patch("/api/conversations/{conversation_id}/resolve")
+@app.patch("/api/conversations/{conversation_id}/resolve", dependencies=[Depends(require_auth)])
 async def resolve_conversation_handoff(conversation_id: str):
     """Mark a chat handoff as resolved."""
     conv = await get_conversation(conversation_id)
@@ -319,13 +454,127 @@ async def resolve_conversation_handoff(conversation_id: str):
     return {"status": "resolved", "conversation_id": conversation_id}
 
 
-# --- Dashboard Stats ---
+# --- Protected: Dashboard Stats ---
 
 
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[Depends(require_auth)])
 async def dashboard_stats():
     """Get aggregate stats for the dashboard."""
     return await get_stats()
+
+
+# --- Protected: Recordings (served through auth endpoint, not static mount) ---
+
+
+@app.get("/api/recordings/{call_id}", dependencies=[Depends(require_auth)])
+async def get_recording(call_id: str):
+    """Stream a call recording WAV file. Requires auth."""
+    # Sanitize call_id to prevent path traversal
+    if ".." in call_id or "/" in call_id or "\\" in call_id:
+        raise HTTPException(status_code=400, detail="Invalid call ID")
+    recording_path = RECORDINGS_DIR / f"{call_id}.wav"
+    if not recording_path.exists():
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return FileResponse(str(recording_path), media_type="audio/wav")
+
+
+# --- Protected: Knowledge API ---
+
+
+@app.get("/api/knowledge", dependencies=[Depends(require_auth)])
+async def list_knowledge_files():
+    """List all knowledge markdown files."""
+    files = []
+    for md_file in sorted(KNOWLEDGE_DIR.glob("*.md")):
+        stat = md_file.stat()
+        files.append({
+            "name": md_file.name,
+            "size": stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        })
+    return {"files": files, "count": len(files)}
+
+
+@app.get("/api/knowledge/{filename}", dependencies=[Depends(require_auth)])
+async def get_knowledge_file(filename: str):
+    """Get content of a knowledge file."""
+    filename = validate_knowledge_filename(filename)
+    file_path = KNOWLEDGE_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    content = file_path.read_text(encoding="utf-8")
+    return {"name": filename, "content": content}
+
+
+@app.put("/api/knowledge/{filename}", dependencies=[Depends(require_auth)])
+async def update_knowledge_file(filename: str, request: Request):
+    """Update or create a knowledge file."""
+    filename = validate_knowledge_filename(filename)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    content = body.get("content", "")
+    file_path = KNOWLEDGE_DIR / filename
+    file_path.write_text(content, encoding="utf-8")
+    logger.info(f"Knowledge file updated: {filename} ({len(content)} chars)")
+    return {"status": "saved", "name": filename}
+
+
+@app.post("/api/knowledge", dependencies=[Depends(require_auth)])
+async def create_knowledge_file(request: Request):
+    """Create a new knowledge file."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    filename = validate_knowledge_filename(body.get("name", ""))
+    content = body.get("content", "")
+
+    file_path = KNOWLEDGE_DIR / filename
+    if file_path.exists():
+        raise HTTPException(status_code=409, detail="File already exists")
+
+    file_path.write_text(content, encoding="utf-8")
+    logger.info(f"Knowledge file created: {filename}")
+    return {"status": "created", "name": filename}
+
+
+@app.delete("/api/knowledge/{filename}", dependencies=[Depends(require_auth)])
+async def delete_knowledge_file(filename: str):
+    """Delete a knowledge file."""
+    filename = validate_knowledge_filename(filename)
+    file_path = KNOWLEDGE_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    file_path.unlink()
+    logger.info(f"Knowledge file deleted: {filename}")
+    return {"status": "deleted", "name": filename}
+
+
+@app.post("/api/knowledge/{filename}/rename", dependencies=[Depends(require_auth)])
+async def rename_knowledge_file(filename: str, request: Request):
+    """Rename a knowledge file."""
+    filename = validate_knowledge_filename(filename)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    new_name = validate_knowledge_filename(body.get("new_name", ""))
+    old_path = KNOWLEDGE_DIR / filename
+    new_path = KNOWLEDGE_DIR / new_name
+
+    if not old_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if new_path.exists():
+        raise HTTPException(status_code=409, detail="Target filename already exists")
+
+    old_path.rename(new_path)
+    logger.info(f"Knowledge file renamed: {filename} -> {new_name}")
+    return {"status": "renamed", "old_name": filename, "new_name": new_name}
 
 
 # --- Dashboard ---
@@ -337,13 +586,13 @@ async def dashboard():
     return RedirectResponse(url="/static/dashboard.html")
 
 
-# --- Health ---
+# --- Health (no auth) ---
 
 
 @app.get("/health")
 async def health():
     """Health check for Coolify."""
-    return {"status": "ok", "service": "ifs-voice-agent", "version": "3.0.0"}
+    return {"status": "ok", "service": "ifs-voice-agent", "version": "3.1.0"}
 
 
 async def run_server(host: str, port: int):
