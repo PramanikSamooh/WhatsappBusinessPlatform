@@ -870,6 +870,14 @@
         } catch (e) { if (e.message !== 'Unauthorized') alert('Failed to resolve: ' + e.message); }
     }
 
+    async function deleteRecording(callId) {
+        if (!confirm('Delete this call recording? This cannot be undone.')) return;
+        try {
+            await authFetch(`/api/recordings/${callId}`, { method: 'DELETE' });
+            refreshAll();
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Failed to delete recording: ' + e.message); }
+    }
+
     // --- Quick Message (from Calls/Contacts) ---
 
     let _qmPhone = '';
@@ -1030,7 +1038,7 @@
                             <div class="max-w-3xl">
                                 <h4 class="font-medium text-gray-700 mb-2">Transcript</h4>
                                 <div class="bg-white border rounded p-3 max-h-64 overflow-y-auto text-sm">${renderTranscript(c.transcript)}</div>
-                                ${recordingSrc ? `<div class="mt-2"><h4 class="font-medium text-gray-700 mb-1">Recording</h4><audio controls class="w-full" src="${recordingSrc}"></audio></div>` : ''}
+                                ${recordingSrc ? `<div class="mt-2"><div class="flex items-center justify-between mb-1"><h4 class="font-medium text-gray-700">Recording</h4><button onclick="event.stopPropagation(); deleteRecording('${safeId}')" class="text-xs bg-red-100 text-red-700 px-2 py-1 rounded hover:bg-red-200">Delete Recording</button></div><audio controls class="w-full" src="${recordingSrc}"></audio></div>` : ''}
                             </div>
                         </td>
                     </tr>`;

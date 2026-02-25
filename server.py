@@ -1207,6 +1207,24 @@ async def get_recording(call_id: str):
     return FileResponse(str(recording_path), media_type="audio/wav")
 
 
+@app.delete("/api/recordings/{call_id}", dependencies=[Depends(require_auth_csrf)])
+async def delete_recording(call_id: str):
+    """Delete a call recording WAV file and clear recording_path in DB."""
+    # Sanitize call_id to prevent path traversal
+    if ".." in call_id or "/" in call_id or "\\" in call_id:
+        raise HTTPException(status_code=400, detail="Invalid call ID")
+    recording_path = RECORDINGS_DIR / f"{call_id}.wav"
+    if recording_path.exists():
+        recording_path.unlink()
+        logger.info(f"Recording deleted: {call_id}.wav")
+    # Clear recording_path in DB
+    try:
+        await complete_call_record(call_id, recording_path="")
+    except Exception as e:
+        logger.error(f"Failed to clear recording_path in DB for {call_id}: {e}")
+    return {"success": True}
+
+
 # --- Protected: Knowledge API ---
 
 

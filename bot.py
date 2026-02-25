@@ -30,6 +30,7 @@ from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
+from contacts_db import get_or_create_contact
 from db import complete_call_record, create_call_record
 from hooks import send_call_summary
 from knowledge import load_prompt
@@ -172,6 +173,14 @@ async def run_bot(
             )
         except Exception as e:
             logger.error(f"Call {call_id}: Failed to create DB record: {e}")
+
+        # Auto-create contact in CRM for callers
+        if caller_phone:
+            try:
+                await get_or_create_contact(caller_phone, caller_name or "")
+                logger.info(f"Call {call_id}: Contact ensured for {caller_phone}")
+            except Exception as e:
+                logger.error(f"Call {call_id}: Failed to create contact: {e}")
 
         # Trigger the AI greeting
         await task.queue_frames([LLMRunFrame()])
