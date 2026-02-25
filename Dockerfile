@@ -23,6 +23,13 @@ COPY . .
 # Create directories for persistent data (mount as volumes in production)
 RUN mkdir -p recordings data static
 
+# Keep a pristine copy of knowledge/ so new files can be synced into the volume
+RUN cp -r knowledge knowledge.defaults
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 EXPOSE 7860
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "7860"]
