@@ -7,10 +7,14 @@ Uses the 24-hour messaging window: since the user just called us,
 we are within the window and can send session messages without templates.
 """
 
+import json
 import os
 
 import aiohttp
 from loguru import logger
+from openai import AsyncOpenAI
+
+from knowledge import load_prompt
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
@@ -216,13 +220,32 @@ async def send_followup_message(
     caller_phone: str,
     caller_name: str,
     handoff_requested: bool,
+    transcript: list[dict] | None = None,
+    topics: list[str] | None = None,
+    knowledge_context: str = "",
 ):
-    """Send post-call follow-up message with thank-you and contact info."""
+    """Send personalized post-call follow-up message via GPT-4o.
+
+    Uses the call transcript and knowledge base to generate a relevant
+    follow-up message instead of a generic thank-you.
+
+    Falls back to a generic message if GPT-4o is unavailable or fails.
+    """
     if not caller_phone:
         return
 
     name = caller_name or "there"
 
+    # Try GPT-4o personalized message if we have a transcript
+    if transcript and os.getenv("OPENAI_API_KEY"):
+        personalized = await _generate_personalized_followup(
+            name, handoff_requested, transcript, topics or [], knowledge_context
+        )
+        if personalized:
+            await send_whatsapp_text(caller_phone, personalized)
+            return
+
+    # Fallback: generic message
     if handoff_requested:
         message = (
             f"Hi {name}! Thank you for calling Institute of Financial Studies.\n\n"
@@ -243,3 +266,50 @@ async def send_followup_message(
         )
 
     await send_whatsapp_text(caller_phone, message)
+
+
+async def _generate_personalized_followup(
+    caller_name: str,
+    handoff_requested: bool,
+    transcript: list[dict],
+    topics: list[str],
+    knowledge_context: str,
+) -> str | None:
+    """Use GPT-4o to generate a personalized follow-up from the call transcript."""
+    # Format transcript for the prompt
+    transcript_text = "\n".join(
+        f"{t['role'].upper()}: {t['content']}" for t in transcript if t.get("content")
+    )
+
+    followup_prompt = load_prompt("followup", "")
+    if not followup_prompt:
+        logger.warning("No followup prompt template found, using generic message")
+        return None
+
+    try:
+        system_prompt = followup_prompt.format(
+            knowledge=knowledge_context or "No knowledge available.",
+            transcript=transcript_text,
+            caller_name=caller_name,
+            topics=", ".join(topics) if topics else "General inquiry",
+            handoff="Yes" if handoff_requested else "No",
+            support_phone=SUPPORT_PHONE,
+        )
+    except KeyError as e:
+        logger.error(f"Followup prompt template missing placeholder: {e}")
+        return None
+
+    try:
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": system_prompt}],
+            max_tokens=400,
+            temperature=0.7,
+        )
+        message = response.choices[0].message.content.strip()
+        logger.info(f"Personalized follow-up generated: {message[:100]}...")
+        return message
+    except Exception as e:
+        logger.error(f"GPT-4o follow-up generation failed: {e}")
+        return None

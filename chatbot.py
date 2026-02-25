@@ -11,6 +11,7 @@ import os
 from loguru import logger
 from openai import AsyncOpenAI
 
+from knowledge import load_prompt
 from chat_db import (
     add_message,
     check_duplicate_message,
@@ -24,7 +25,10 @@ from whatsapp_messaging import mark_message_as_read, send_whatsapp_text
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-CHAT_SYSTEM_PROMPT = """You are an AI assistant for Institute of Financial Studies (IFS), Jaipur.
+SUPPORT_PHONE = os.getenv("IFS_SUPPORT_PHONE", "+91 78913 93505")
+
+# Hardcoded fallback — only used if knowledge/prompt_chatbot.md is missing
+_DEFAULT_CHATBOT_PROMPT = """You are an AI assistant for Institute of Financial Studies (IFS), Jaipur.
 
 IMPORTANT RULES:
 - You are responding to WhatsApp text messages. Keep replies clear and helpful (3-5 sentences).
@@ -38,8 +42,6 @@ IMPORTANT RULES:
 YOUR KNOWLEDGE:
 {knowledge}
 """
-
-SUPPORT_PHONE = os.getenv("IFS_SUPPORT_PHONE", "+91 78913 93505")
 
 FALLBACK_MESSAGE = (
     "I'm sorry, I'm having trouble processing your message right now. "
@@ -140,7 +142,8 @@ async def _call_gpt4o(knowledge_context: str, messages: list[dict]) -> str:
         logger.error("OPENAI_API_KEY not set")
         return FALLBACK_MESSAGE
 
-    system_prompt = CHAT_SYSTEM_PROMPT.format(
+    chatbot_prompt = load_prompt("chatbot", _DEFAULT_CHATBOT_PROMPT)
+    system_prompt = chatbot_prompt.format(
         knowledge=knowledge_context or "No knowledge documents loaded yet.",
         support_phone=SUPPORT_PHONE,
     )

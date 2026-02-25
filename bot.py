@@ -32,6 +32,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from db import complete_call_record, create_call_record
 from hooks import send_call_summary
+from knowledge import load_prompt
 from utils import detect_handoff, extract_topics, generate_id
 from whatsapp_messaging import send_followup_message
 
@@ -41,17 +42,14 @@ load_dotenv(override=True)
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
-AGENT_RULES = """You are an AI voice assistant for Institute of Financial Studies (IFS), Jaipur.
+# Hardcoded fallback — only used if knowledge/prompt_voice.md is missing
+_DEFAULT_VOICE_PROMPT = """You are an AI voice assistant for Institute of Financial Studies (IFS), Jaipur.
 
 IMPORTANT RULES:
 - You are answering a live phone call. Keep responses brief (1-3 sentences).
-- Speak naturally like a helpful receptionist, not like a chatbot.
 - Respond in the SAME LANGUAGE the caller speaks (Hindi or English).
 - Only answer from the knowledge provided below. Never make up information.
-- If you don't know something, say: "I would be happy to connect you with our admissions team for more details. You can also reach us at our office number."
-- Do not use special characters, emojis, or markdown in your responses (output is converted to speech).
-- Be warm, professional, and helpful.
-- If the caller wants to speak to a human, say: "I will let our team know. Someone will call you back shortly."
+- When the caller asks for details hard to convey on a call, tell them you will send it on WhatsApp after the call.
 
 YOUR KNOWLEDGE:
 {knowledge}
@@ -71,7 +69,8 @@ async def run_bot(
     call_id = generate_id()
     logger.info(f"Call {call_id}: Starting bot for {caller_phone} ({caller_name})")
 
-    system_instruction = AGENT_RULES.format(
+    voice_prompt = load_prompt("voice", _DEFAULT_VOICE_PROMPT)
+    system_instruction = voice_prompt.format(
         knowledge=knowledge_context or "No knowledge documents loaded yet."
     )
 
@@ -235,10 +234,17 @@ async def run_bot(
         except Exception as e:
             logger.error(f"Call {call_id}: Failed to update DB: {e}")
 
-        # Send WhatsApp follow-up text message
+        # Send personalized WhatsApp follow-up text message
         if caller_phone:
             try:
-                await send_followup_message(caller_phone, caller_name, handoff_requested)
+                await send_followup_message(
+                    caller_phone,
+                    caller_name,
+                    handoff_requested,
+                    transcript=transcript,
+                    topics=topics,
+                    knowledge_context=knowledge_context,
+                )
             except Exception as e:
                 logger.error(f"Call {call_id}: Failed to send WhatsApp text: {e}")
 
