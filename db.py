@@ -83,6 +83,8 @@ async def _run_migrations(db_path):
         ("messages", "direction", "TEXT DEFAULT 'inbound'"),
         ("messages", "source", "TEXT DEFAULT 'ai'"),
         ("messages", "status", "TEXT DEFAULT ''"),
+        ("messages", "media_key", "TEXT DEFAULT ''"),
+        ("messages", "msg_type", "TEXT DEFAULT 'text'"),
     ]
     async with aiosqlite.connect(db_path) as db:
         for table, column, col_type in migrations:

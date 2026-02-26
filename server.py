@@ -43,6 +43,7 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.whatsapp.api import WhatsAppWebhookRequest
 from pipecat.transports.whatsapp.client import WhatsAppClient
 
+import media_storage
 from bot import run_bot
 from chat_db import (
     get_conversation,
@@ -267,6 +268,9 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     await init_db()
+
+    # Initialize MinIO bucket + lifecycle rules
+    media_storage.init_bucket()
 
     # Load knowledge docs at startup
     knowledge_context = load_knowledge()
@@ -596,8 +600,17 @@ async def get_inbox(limit: int = 50):
 
 @app.get("/api/inbox/{conversation_id}/messages", dependencies=[Depends(require_auth)])
 async def get_inbox_messages(conversation_id: str, limit: int = 50, offset: int = 0):
-    """Get paginated messages for a conversation thread."""
+    """Get paginated messages for a conversation thread with presigned media URLs."""
     messages = await get_conversation_messages(conversation_id, limit, offset)
+
+    # Enrich messages that have media_key with presigned URLs
+    for msg in messages:
+        media_key = msg.get("media_key", "")
+        if media_key and media_storage.is_configured():
+            msg["media_url"] = media_storage.generate_presigned_url(media_key)
+        else:
+            msg["media_url"] = None
+
     return {"messages": messages, "count": len(messages)}
 
 
@@ -1231,10 +1244,18 @@ async def dashboard_stats():
 
 @app.get("/api/recordings/{call_id}", dependencies=[Depends(require_auth)])
 async def get_recording(call_id: str):
-    """Stream a call recording WAV file. Requires auth."""
-    # Sanitize call_id to prevent path traversal
+    """Stream a call recording. Tries MinIO first, falls back to local file."""
     if ".." in call_id or "/" in call_id or "\\" in call_id:
         raise HTTPException(status_code=400, detail="Invalid call ID")
+
+    # Try MinIO presigned URL redirect
+    if media_storage.is_configured():
+        key = media_storage.build_recording_key(call_id)
+        url = media_storage.generate_presigned_url(key)
+        if url:
+            return RedirectResponse(url=url)
+
+    # Fallback to local file
     recording_path = RECORDINGS_DIR / f"{call_id}.wav"
     if not recording_path.exists():
         raise HTTPException(status_code=404, detail="Recording not found")
@@ -1243,20 +1264,39 @@ async def get_recording(call_id: str):
 
 @app.delete("/api/recordings/{call_id}", dependencies=[Depends(require_auth_csrf)])
 async def delete_recording(call_id: str):
-    """Delete a call recording WAV file and clear recording_path in DB."""
-    # Sanitize call_id to prevent path traversal
+    """Delete a call recording from MinIO and/or local filesystem."""
     if ".." in call_id or "/" in call_id or "\\" in call_id:
         raise HTTPException(status_code=400, detail="Invalid call ID")
+
+    # Delete from MinIO
+    if media_storage.is_configured():
+        media_storage.delete_object(media_storage.build_recording_key(call_id))
+
+    # Delete local file
     recording_path = RECORDINGS_DIR / f"{call_id}.wav"
     if recording_path.exists():
         recording_path.unlink()
-        logger.info(f"Recording deleted: {call_id}.wav")
+        logger.info(f"Recording deleted locally: {call_id}.wav")
+
     # Clear recording_path in DB
     try:
         await complete_call_record(call_id, recording_path="")
     except Exception as e:
         logger.error(f"Failed to clear recording_path in DB for {call_id}: {e}")
     return {"success": True}
+
+
+@app.get("/api/media/presign", dependencies=[Depends(require_auth)])
+async def get_media_presigned_url(key: str = ""):
+    """Generate a presigned URL for a MinIO object."""
+    if not key:
+        raise HTTPException(status_code=400, detail="key parameter is required")
+    if ".." in key:
+        raise HTTPException(status_code=400, detail="Invalid key")
+    url = media_storage.generate_presigned_url(key)
+    if not url:
+        raise HTTPException(status_code=404, detail="Object not found or MinIO not configured")
+    return {"url": url, "expires_in": media_storage.PRESIGNED_URL_EXPIRY}
 
 
 # --- Protected: Knowledge API ---

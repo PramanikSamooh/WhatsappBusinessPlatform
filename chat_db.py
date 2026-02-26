@@ -119,6 +119,8 @@ async def add_message(
     wa_message_id: str = "",
     direction: str = "inbound",
     source: str = "ai",
+    msg_type: str = "text",
+    media_key: str = "",
 ) -> str:
     """Add a message to a conversation. Returns message ID."""
     msg_id = generate_id()
@@ -126,8 +128,8 @@ async def add_message(
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO messages (id, conversation_id, role, content, wa_message_id, direction, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (msg_id, conversation_id, role, content, wa_message_id, direction, source, now),
+            "INSERT INTO messages (id, conversation_id, role, content, wa_message_id, direction, source, msg_type, media_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (msg_id, conversation_id, role, content, wa_message_id, direction, source, msg_type, media_key, now),
         )
         await db.execute(
             "UPDATE conversations SET last_message_at = ?, message_count = message_count + 1 WHERE id = ?",

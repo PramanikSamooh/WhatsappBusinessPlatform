@@ -118,6 +118,90 @@ async def mark_message_as_read(message_id: str) -> bool:
         return False
 
 
+async def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str, str]:
+    """Download media binary from WhatsApp Cloud API (2-step process).
+
+    Step 1: GET graph.facebook.com/{version}/{media_id} → get download URL.
+    Step 2: GET that URL with Authorization header → get binary content.
+
+    Args:
+        media_id: The WhatsApp media ID from the webhook payload.
+
+    Returns:
+        Tuple of (binary_data, mime_type, filename).
+        Returns (None, '', '') on failure.
+    """
+    if not all([WHATSAPP_TOKEN, media_id]):
+        return None, "", ""
+
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Step 1: Get media URL
+            meta_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}"
+            async with session.get(
+                meta_url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"Media URL fetch failed ({resp.status}): {body[:200]}")
+                    return None, "", ""
+                meta = await resp.json()
+
+            media_url = meta.get("url", "")
+            mime_type = meta.get("mime_type", "application/octet-stream")
+
+            if not media_url:
+                logger.warning(f"No URL in media metadata for {media_id}")
+                return None, "", ""
+
+            # Step 2: Download binary
+            async with session.get(
+                media_url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Media download failed ({resp.status}) for {media_id}")
+                    return None, "", ""
+                data = await resp.read()
+
+            # Derive filename from media_id + extension
+            ext = _mime_to_extension(mime_type)
+            filename = f"{media_id}{ext}"
+
+            logger.info(f"Downloaded media {media_id}: {len(data)} bytes, {mime_type}")
+            return data, mime_type, filename
+
+    except Exception as e:
+        logger.error(f"Failed to download media {media_id}: {e}")
+        return None, "", ""
+
+
+def _mime_to_extension(mime_type: str) -> str:
+    """Convert MIME type to file extension."""
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "video/mp4": ".mp4",
+        "video/3gpp": ".3gp",
+        "audio/aac": ".aac",
+        "audio/mp4": ".m4a",
+        "audio/mpeg": ".mp3",
+        "audio/ogg": ".ogg",
+        "audio/amr": ".amr",
+        "application/pdf": ".pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/msword": ".doc",
+        "text/plain": ".txt",
+    }
+    return mapping.get(mime_type, ".bin")
+
+
 async def send_whatsapp_template(
     to_phone: str,
     template_name: str,

@@ -6,7 +6,7 @@ WhatsApp webhook events and routes them to the appropriate handler:
 - text messages → AI chatbot or manual inbox (based on ai_enabled)
 - call events → forwarded to Pipecat voice agent (handled by server.py)
 - delivery statuses → update message status in DB + campaign tracking
-- media → store and acknowledge
+- media → download to MinIO, store and acknowledge
 - interactive → store reply (button/list)
 - order → full order processing with Razorpay payment
 
@@ -22,7 +22,8 @@ from chat_db import add_message, get_or_create_conversation, update_message_stat
 from chatbot import handle_text_message
 from contacts_db import get_or_create_contact
 from orders import process_incoming_order
-from whatsapp_messaging import mark_message_as_read, send_whatsapp_text
+import media_storage
+from whatsapp_messaging import download_whatsapp_media, mark_message_as_read, send_whatsapp_text
 
 SUPPORT_PHONE = os.getenv("IFS_SUPPORT_PHONE", "+91 78913 93505")
 
@@ -178,7 +179,7 @@ async def _handle_media(
     wa_message_id: str,
     contact_id: str,
 ) -> dict:
-    """Handle media messages — store a reference and acknowledge."""
+    """Handle media messages — download to MinIO, store reference, acknowledge."""
     if wa_message_id:
         await mark_message_as_read(wa_message_id)
 
@@ -188,16 +189,27 @@ async def _handle_media(
     mime_type = media_obj.get("mime_type", "")
     caption = media_obj.get("caption", "")
 
-    content = f"[{msg_type.upper()}] {caption}" if caption else f"[{msg_type.upper()} received]"
-    if media_id:
-        content += f" (media_id: {media_id}, type: {mime_type})"
+    # Build display content
+    content = caption if caption else f"[{msg_type.upper()} received]"
 
-    # Store in conversation
+    # Get or create conversation
     conversation = await get_or_create_conversation(sender_phone, sender_name, contact_id)
     conv_id = conversation["id"]
+
+    # Attempt to download and store media in MinIO
+    media_key = ""
+    if media_id and media_storage.is_configured():
+        data, dl_mime, filename = await download_whatsapp_media(media_id)
+        if data:
+            key = media_storage.build_media_key(conv_id, filename)
+            if media_storage.upload_bytes(key, data, dl_mime or mime_type):
+                media_key = key
+
+    # Store message with media metadata
     await add_message(
         conv_id, "user", content, wa_message_id,
         direction="inbound", source="user",
+        msg_type=msg_type, media_key=media_key,
     )
 
     # Auto-reply acknowledging the media
@@ -205,8 +217,8 @@ async def _handle_media(
     await send_whatsapp_text(sender_phone, reply)
     await add_message(conv_id, "assistant", reply, direction="outbound", source="ai")
 
-    logger.info(f"Media ({msg_type}) from {sender_phone} stored in conv {conv_id}")
-    return {"action": "media_stored", "type": msg_type, "phone": sender_phone}
+    logger.info(f"Media ({msg_type}) from {sender_phone} stored in conv {conv_id}, minio={media_key or 'none'}")
+    return {"action": "media_stored", "type": msg_type, "phone": sender_phone, "media_key": media_key}
 
 
 async def _handle_interactive(

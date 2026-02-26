@@ -30,6 +30,7 @@ from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
+import media_storage
 from contacts_db import get_or_create_contact, is_blocked
 from db import complete_call_record, create_call_record
 from hooks import send_call_summary
@@ -155,6 +156,16 @@ async def run_bot(
                 wf.setframerate(sample_rate)
                 wf.writeframes(audio)
             logger.info(f"Call {call_id}: Audio saved to {recording_path} ({recording_path.stat().st_size} bytes)")
+
+            # Upload to MinIO if configured
+            if media_storage.is_configured():
+                key = media_storage.build_recording_key(call_id)
+                with open(str(recording_path), "rb") as f:
+                    wav_bytes = f.read()
+                if media_storage.upload_bytes(key, wav_bytes, "audio/wav"):
+                    logger.info(f"Call {call_id}: Recording uploaded to MinIO: {key}")
+                else:
+                    logger.warning(f"Call {call_id}: MinIO upload failed, keeping local copy")
         except Exception as e:
             logger.error(f"Call {call_id}: Failed to save audio: {e}")
 
@@ -236,6 +247,12 @@ async def run_bot(
         except Exception:
             pass
 
+        # Determine recording path: MinIO key or local path
+        if media_storage.is_configured():
+            recording_store_path = media_storage.build_recording_key(call_id)
+        else:
+            recording_store_path = recording_rel_path
+
         # Update database
         try:
             await complete_call_record(
@@ -243,7 +260,7 @@ async def run_bot(
                 disconnected_at=call_metadata["disconnected_at"],
                 duration_seconds=duration_seconds,
                 transcript=json.dumps(transcript, ensure_ascii=False),
-                recording_path=recording_rel_path,
+                recording_path=recording_store_path,
                 handoff_requested=1 if handoff_requested else 0,
                 handoff_reason=handoff_reason,
                 topics=json.dumps(topics, ensure_ascii=False),
