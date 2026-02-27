@@ -46,6 +46,16 @@
         }
         @media (max-width: 767px) { .modal-content { width: 100% !important; max-width: 100% !important; height: 100% !important; max-height: 100% !important; border-radius: 0 !important; margin: 0 !important; } }
         @media (max-width: 767px) { .touch-target { min-height: 44px; min-width: 44px; } }
+        @media (max-width: 767px) { .stats-hidden { display: none !important; } }
+        @media (max-width: 767px) {
+            body { font-size: 15px; }
+            .mobile-card-item { font-size: 15px; }
+            .mobile-card-item .font-semibold { font-size: 17px; }
+            #panel-inbox .font-semibold { font-size: 16px; }
+            #stats-section .text-sm { font-size: 14px; }
+            #stats-section .text-2xl { font-size: 1.75rem; }
+            #panel-knowledge .text-sm { font-size: 14px; }
+        }
         .more-menu { position: fixed; bottom: 0; left: 0; right: 0; z-index: 60; background: white; border-top-left-radius: 16px; border-top-right-radius: 16px; box-shadow: 0 -4px 20px rgba(0,0,0,0.15); transform: translateY(100%); transition: transform 0.25s ease; }
         .more-menu.open { transform: translateY(0); }
         .more-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.3); z-index: 55; display: none; }
@@ -90,8 +100,22 @@
             </div>
         </nav>
 
-        <!-- Stats -->
-        <div class="max-w-7xl mx-auto px-4 mt-4">
+        <!-- PWA Install Banner -->
+        <div id="pwa-install-banner" class="hidden bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center justify-between">
+            <span class="text-sm text-blue-800 font-medium">Install app for quick access</span>
+            <div class="flex gap-2">
+                <button onclick="installPWA()" class="text-sm bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700">Install</button>
+                <button onclick="dismissInstall()" class="text-sm text-blue-600 px-2 py-1">Later</button>
+            </div>
+        </div>
+        <!-- iOS Install Tip -->
+        <div id="ios-install-tip" class="hidden bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center justify-between">
+            <span class="text-sm text-blue-800">Tap <strong>Share</strong> then <strong>Add to Home Screen</strong> to install</span>
+            <button onclick="dismissIOSTip()" class="text-sm text-blue-600 px-2 py-1 font-bold">✕</button>
+        </div>
+
+        <!-- Stats (mobile: only shown on Calls tab) -->
+        <div id="stats-section" class="max-w-7xl mx-auto px-4 mt-4">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div class="bg-white rounded-lg shadow-sm p-4 border">
                     <p class="text-sm text-gray-500">Calls Today</p>
@@ -935,6 +959,10 @@
                 btn.classList.add('text-gray-500');
             }
         });
+        // Hide stats on non-Calls tabs (mobile only)
+        const stats = document.getElementById('stats-section');
+        if (stats) stats.classList.toggle('stats-hidden', tab !== 'calls' && isMobile());
+
         if (tab === 'knowledge') loadKnowledgeFiles();
         if (tab === 'inbox') { loadInbox(); startInboxPoll(); resetInboxMobileView(); }
         else { stopInboxPoll(); }
@@ -1000,6 +1028,9 @@
     window.addEventListener('resize', () => {
         if (currentTab === 'inbox') resetInboxMobileView();
         if (currentTab === 'knowledge') resetKnowledgeMobileView();
+        // Re-evaluate stats visibility on resize
+        const stats = document.getElementById('stats-section');
+        if (stats) stats.classList.toggle('stats-hidden', currentTab !== 'calls' && isMobile());
     });
 
     // --- Helpers ---
@@ -2662,8 +2693,43 @@
         if (pullDist > 80 && window.scrollY === 0) refreshAll();
     });
 
+    // --- PWA Install ---
+    let deferredPrompt = null;
+    window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+        if (!localStorage.getItem('pwa-install-dismissed')) {
+            document.getElementById('pwa-install-banner').classList.remove('hidden');
+        }
+    });
+    function installPWA() {
+        if (deferredPrompt) {
+            deferredPrompt.prompt();
+            deferredPrompt.userChoice.then(() => {
+                deferredPrompt = null;
+                document.getElementById('pwa-install-banner').classList.add('hidden');
+            });
+        }
+    }
+    function dismissInstall() {
+        document.getElementById('pwa-install-banner').classList.add('hidden');
+        localStorage.setItem('pwa-install-dismissed', '1');
+    }
+    function checkIOSInstall() {
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+        const isStandalone = window.navigator.standalone === true;
+        if (isIOS && !isStandalone && !localStorage.getItem('ios-install-dismissed')) {
+            document.getElementById('ios-install-tip').classList.remove('hidden');
+        }
+    }
+    function dismissIOSTip() {
+        document.getElementById('ios-install-tip').classList.add('hidden');
+        localStorage.setItem('ios-install-dismissed', '1');
+    }
+
     // --- Init ---
     loadBranding();
+    checkIOSInstall();
     checkAuth();
     </script>
 </body>
