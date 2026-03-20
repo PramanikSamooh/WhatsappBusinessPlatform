@@ -285,9 +285,14 @@ async def run_bot(
         await params.result_callback({"status": "ending_call", "reason": reason})
         # Wait for goodbye audio to finish playing
         await asyncio.sleep(3)
-        logger.info(f"Call {call_id}: Auto-hangup — saving call data before EndFrame")
-        await finalize_call()
+        logger.info(f"Call {call_id}: Auto-hangup executing")
+        # End the pipeline first — on_disconnected will handle saving
         await task.queue_frame(EndFrame())
+        # If on_disconnected doesn't fire within 5s, force finalize
+        await asyncio.sleep(5)
+        if not _finalized:
+            logger.warning(f"Call {call_id}: on_disconnected did not fire, force-finalizing")
+            await finalize_call()
 
     llm.register_function("end_call", handle_end_call)
 
