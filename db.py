@@ -100,7 +100,7 @@ async def create_call_record(call_id: str, caller_phone: str, caller_name: str, 
     """Insert initial call record when call connects."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO calls (id, caller_phone, caller_name, connected_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO calls (id, caller_phone, caller_name, connected_at, status) VALUES (?, ?, ?, ?, 'active')",
             (call_id, caller_phone, caller_name, connected_at),
         )
         await db.commit()
