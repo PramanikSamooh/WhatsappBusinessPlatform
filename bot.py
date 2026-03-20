@@ -133,7 +133,7 @@ async def run_bot(
         [
             {
                 "role": "user",
-                "content": f"A customer is calling {_BUSINESS_SHORT or _BUSINESS_NAME}. Greet them warmly and ask how you can help.",
+                "content": f"A customer is calling {_BUSINESS_SHORT or _BUSINESS_NAME}. Greet them briefly.",
             }
         ],
         tools=_tools,
@@ -229,16 +229,17 @@ async def run_bot(
             try:
                 if await is_blocked(caller_phone):
                     logger.info(f"Call {call_id}: BLOCKED caller {caller_phone}, disconnecting")
-                    # Queue EndFrame for graceful pipeline shutdown (triggers on_client_disconnected)
                     await task.queue_frame(EndFrame())
                     return
             except Exception as e:
                 logger.error(f"Call {call_id}: Block check failed: {e}")
 
-        # Start audio recording
+        # Start audio recording + trigger AI greeting IMMEDIATELY
+        # (don't let DB/contact ops delay the greeting)
         await audiobuffer.start_recording()
+        await task.queue_frames([LLMRunFrame()])
 
-        # Create initial DB record
+        # Housekeeping — runs after greeting is already queued
         try:
             await create_call_record(
                 call_id, caller_phone, caller_name, call_metadata["connected_at"]
@@ -246,16 +247,12 @@ async def run_bot(
         except Exception as e:
             logger.error(f"Call {call_id}: Failed to create DB record: {e}")
 
-        # Auto-create contact in CRM for callers
         if caller_phone:
             try:
                 await get_or_create_contact(caller_phone, caller_name or "")
                 logger.info(f"Call {call_id}: Contact ensured for {caller_phone}")
             except Exception as e:
                 logger.error(f"Call {call_id}: Failed to create contact: {e}")
-
-        # Trigger the AI greeting
-        await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(transport_obj, client):

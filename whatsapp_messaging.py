@@ -475,23 +475,19 @@ async def send_followup_message(
             await send_whatsapp_text(caller_phone, personalized)
             return
 
-    # Fallback: generic message
-    biz = BUSINESS_NAME
+    # Fallback: short generic message
     biz_short = BUSINESS_SHORT or BUSINESS_NAME
     if handoff_requested:
         message = (
-            f"Hi {name}! Thank you for calling {biz}.\n\n"
-            f"We noticed you would like to speak with our team directly. "
-            f"A team member will reach out to you shortly.\n\n"
-            + (f"In the meantime, feel free to reach us at:\nPhone: {SUPPORT_PHONE}\nMon-Sat: 10 AM - 6 PM\n\n" if SUPPORT_PHONE else "")
-            + f"Thank you for your interest in {biz_short}!"
+            f"Hi {name}, thanks for calling {biz_short}!\n"
+            f"Our team will call you back shortly."
+            + (f"\nContact: {SUPPORT_PHONE}" if SUPPORT_PHONE else "")
         )
     else:
         message = (
-            f"Hi {name}! Thank you for calling {biz}.\n\n"
-            f"If you have any more questions, feel free to call us again"
-            + (f" or reach out at:\nPhone: {SUPPORT_PHONE}\nMon-Sat: 10 AM - 6 PM" if SUPPORT_PHONE else "")
-            + f"\n\nWe look forward to hearing from you!"
+            f"Hi {name}, thanks for calling {biz_short}!\n"
+            f"Feel free to call again if you have more questions."
+            + (f"\nContact: {SUPPORT_PHONE}" if SUPPORT_PHONE else "")
         )
 
     await send_whatsapp_text(caller_phone, message)
@@ -533,7 +529,7 @@ async def _generate_personalized_followup(
         response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": system_prompt}],
-            max_tokens=400,
+            max_tokens=200,
             temperature=0.7,
         )
         message = response.choices[0].message.content.strip()
