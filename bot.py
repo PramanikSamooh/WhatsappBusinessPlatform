@@ -168,14 +168,125 @@ async def run_bot(
         ),
     )
 
+    # --- Shared finalize logic (called on both client disconnect and auto-hangup) ---
+    async def finalize_call():
+        nonlocal _finalized
+        if _finalized:
+            logger.info(f"Call {call_id}: Already finalized, skipping")
+            return
+        _finalized = True
+
+        call_metadata["disconnected_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        logger.info(f"Call {call_id}: Finalizing call")
+
+        transcript = []
+        handoff_requested = False
+        handoff_reason = ""
+        topics = []
+        duration_seconds = 0.0
+
+        try:
+            await audiobuffer.stop_recording()
+
+            try:
+                messages = context.messages
+                for msg in messages:
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if role in ("user", "assistant") and content:
+                        transcript.append({"role": role, "content": str(content)})
+            except Exception as e:
+                logger.error(f"Call {call_id}: Failed to extract transcript: {e}")
+
+            logger.info(f"Call {call_id}: Transcript has {len(transcript)} turns")
+
+            handoff_requested, handoff_reason = detect_handoff(transcript)
+            if handoff_requested:
+                logger.info(f"Call {call_id}: HANDOFF DETECTED — {handoff_reason}")
+
+            topics = extract_topics(transcript)
+            logger.info(f"Call {call_id}: Topics: {topics}")
+
+            try:
+                from dateutil.parser import isoparse
+                t1 = isoparse(call_metadata["connected_at"])
+                t2 = isoparse(call_metadata["disconnected_at"])
+                duration_seconds = (t2 - t1).total_seconds()
+            except Exception:
+                pass
+
+            if media_storage.is_configured():
+                recording_store_path = media_storage.build_recording_key(call_id)
+            else:
+                recording_store_path = recording_rel_path
+
+            await complete_call_record(
+                call_id,
+                disconnected_at=call_metadata["disconnected_at"],
+                duration_seconds=duration_seconds,
+                transcript=json.dumps(transcript, ensure_ascii=False),
+                recording_path=recording_store_path,
+                handoff_requested=1 if handoff_requested else 0,
+                handoff_reason=handoff_reason,
+                topics=json.dumps(topics, ensure_ascii=False),
+                status="handoff_pending" if handoff_requested else "completed",
+            )
+            logger.info(f"Call {call_id}: DB record updated")
+
+        except Exception as e:
+            logger.error(f"Call {call_id}: CRITICAL — finalize_call failed: {e}", exc_info=True)
+            try:
+                await complete_call_record(
+                    call_id,
+                    disconnected_at=call_metadata["disconnected_at"],
+                    duration_seconds=duration_seconds,
+                    transcript=json.dumps(transcript, ensure_ascii=False) if transcript else "[]",
+                    recording_path="",
+                    handoff_requested=0,
+                    handoff_reason="",
+                    topics="[]",
+                    status="completed",
+                )
+            except Exception:
+                pass
+
+        # Post-call actions (non-critical)
+        if caller_phone:
+            try:
+                await send_followup_message(
+                    caller_phone, caller_name, handoff_requested,
+                    transcript=transcript, topics=topics,
+                    knowledge_context=knowledge_context,
+                )
+            except Exception as e:
+                logger.error(f"Call {call_id}: Failed to send WhatsApp text: {e}")
+
+        try:
+            await send_call_summary({
+                "call_id": call_id,
+                "caller_phone": caller_phone,
+                "caller_name": caller_name,
+                "connected_at": call_metadata["connected_at"],
+                "disconnected_at": call_metadata["disconnected_at"],
+                "duration_seconds": duration_seconds,
+                "transcript": transcript,
+                "handoff_requested": handoff_requested,
+                "handoff_reason": handoff_reason,
+                "topics": topics,
+                "recording_path": recording_rel_path,
+            })
+        except Exception as e:
+            logger.error(f"Call {call_id}: Failed to send to n8n: {e}")
+
     # Register end_call function — Gemini calls this to hang up after goodbye
     async def handle_end_call(params: FunctionCallParams):
         reason = params.arguments.get("reason", "conversation complete")
         logger.info(f"Call {call_id}: LLM triggered end_call — {reason}")
         await params.result_callback({"status": "ending_call", "reason": reason})
-        # Wait for the goodbye audio to finish playing before ending
+        # Wait for goodbye audio to finish playing
         await asyncio.sleep(3)
-        logger.info(f"Call {call_id}: Auto-hangup executing")
+        logger.info(f"Call {call_id}: Auto-hangup — saving call data before EndFrame")
+        await finalize_call()
         await task.queue_frame(EndFrame())
 
     llm.register_function("end_call", handle_end_call)
@@ -190,6 +301,7 @@ async def run_bot(
         "connected_at": None,
         "disconnected_at": None,
     }
+    _finalized = False  # Guard against double-finalize
 
     @audiobuffer.event_handler("on_audio_data")
     async def on_audio_data(buffer, audio, sample_rate, num_channels):
@@ -256,100 +368,8 @@ async def run_bot(
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(transport_obj, client):
-        call_metadata["disconnected_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        logger.info(f"Call {call_id}: Disconnected")
-
-        # Stop recording — triggers on_audio_data event with the full audio buffer
-        await audiobuffer.stop_recording()
-
-        # Extract transcript from LLMContext
-        transcript = []
-        try:
-            messages = context.messages
-            for msg in messages:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                if role in ("user", "assistant") and content:
-                    transcript.append({"role": role, "content": str(content)})
-        except Exception as e:
-            logger.error(f"Call {call_id}: Failed to extract transcript: {e}")
-
-        logger.info(f"Call {call_id}: Transcript has {len(transcript)} turns")
-
-        # Detect handoff request
-        handoff_requested, handoff_reason = detect_handoff(transcript)
-        if handoff_requested:
-            logger.info(f"Call {call_id}: HANDOFF DETECTED — {handoff_reason}")
-
-        # Extract topics
-        topics = extract_topics(transcript)
-        logger.info(f"Call {call_id}: Topics: {topics}")
-
-        # Compute duration
-        duration_seconds = 0.0
-        try:
-            from dateutil.parser import isoparse
-            t1 = isoparse(call_metadata["connected_at"])
-            t2 = isoparse(call_metadata["disconnected_at"])
-            duration_seconds = (t2 - t1).total_seconds()
-        except Exception:
-            pass
-
-        # Determine recording path: MinIO key or local path
-        if media_storage.is_configured():
-            recording_store_path = media_storage.build_recording_key(call_id)
-        else:
-            recording_store_path = recording_rel_path
-
-        # Update database
-        try:
-            await complete_call_record(
-                call_id,
-                disconnected_at=call_metadata["disconnected_at"],
-                duration_seconds=duration_seconds,
-                transcript=json.dumps(transcript, ensure_ascii=False),
-                recording_path=recording_store_path,
-                handoff_requested=1 if handoff_requested else 0,
-                handoff_reason=handoff_reason,
-                topics=json.dumps(topics, ensure_ascii=False),
-                status="handoff_pending" if handoff_requested else "completed",
-            )
-            logger.info(f"Call {call_id}: DB record updated")
-        except Exception as e:
-            logger.error(f"Call {call_id}: Failed to update DB: {e}")
-
-        # Send personalized WhatsApp follow-up text message
-        if caller_phone:
-            try:
-                await send_followup_message(
-                    caller_phone,
-                    caller_name,
-                    handoff_requested,
-                    transcript=transcript,
-                    topics=topics,
-                    knowledge_context=knowledge_context,
-                )
-            except Exception as e:
-                logger.error(f"Call {call_id}: Failed to send WhatsApp text: {e}")
-
-        # Send enriched data to n8n
-        try:
-            await send_call_summary({
-                "call_id": call_id,
-                "caller_phone": caller_phone,
-                "caller_name": caller_name,
-                "connected_at": call_metadata["connected_at"],
-                "disconnected_at": call_metadata["disconnected_at"],
-                "duration_seconds": duration_seconds,
-                "transcript": transcript,
-                "handoff_requested": handoff_requested,
-                "handoff_reason": handoff_reason,
-                "topics": topics,
-                "recording_path": recording_rel_path,
-            })
-        except Exception as e:
-            logger.error(f"Call {call_id}: Failed to send to n8n: {e}")
-
+        logger.info(f"Call {call_id}: Client disconnected")
+        await finalize_call()
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)

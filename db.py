@@ -48,7 +48,7 @@ async def init_db():
                 handoff_requested INTEGER DEFAULT 0,
                 handoff_reason   TEXT,
                 topics           TEXT,
-                status           TEXT DEFAULT 'completed',
+                status           TEXT DEFAULT 'active',
                 created_at       TEXT DEFAULT (datetime('now'))
             )
         """)
