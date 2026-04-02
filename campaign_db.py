@@ -316,7 +316,7 @@ async def update_recipient_status(
         await db.commit()
 
 
-async def update_recipient_by_wamid(wa_message_id: str, status: str) -> bool:
+async def update_recipient_by_wamid(wa_message_id: str, status: str, error_message: str = "") -> bool:
     """Update recipient status by WhatsApp message ID (for delivery webhooks)."""
     if not wa_message_id:
         return False
@@ -325,7 +325,18 @@ async def update_recipient_by_wamid(wa_message_id: str, status: str) -> bool:
     time_field = field_map.get(status)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        if time_field:
+        if status == "failed" and error_message:
+            if time_field:
+                await db.execute(
+                    f"UPDATE campaign_recipients SET status = ?, error_message = ?, {time_field} = ? WHERE wa_message_id = ?",
+                    (status, error_message[:500], now, wa_message_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE campaign_recipients SET status = ?, error_message = ? WHERE wa_message_id = ?",
+                    (status, error_message[:500], wa_message_id),
+                )
+        elif time_field:
             await db.execute(
                 f"UPDATE campaign_recipients SET status = ?, {time_field} = ? WHERE wa_message_id = ?",
                 (status, now, wa_message_id),

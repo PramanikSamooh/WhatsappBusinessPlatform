@@ -337,12 +337,24 @@ async def _handle_statuses(statuses: list) -> None:
         wa_message_id = status_obj.get("id", "")
         status = status_obj.get("status", "")  # sent, delivered, read, failed
         if wa_message_id and status:
+            # Extract error details for failed messages
+            error_message = ""
+            if status == "failed":
+                errors = status_obj.get("errors", [])
+                if errors:
+                    err = errors[0]
+                    error_message = f"[{err.get('code', '?')}] {err.get('title', '')}: {err.get('message', '')}"
+                    error_data = err.get("error_data", {})
+                    if error_data.get("details"):
+                        error_message += f" — {error_data['details']}"
+                logger.warning(f"Message failed: {wa_message_id} — {error_message}")
+
             # Update conversation message status
             await update_message_status(wa_message_id, status)
 
             # Also update campaign recipient status (if this was a campaign message)
             try:
-                await update_recipient_by_wamid(wa_message_id, status)
+                await update_recipient_by_wamid(wa_message_id, status, error_message=error_message)
             except Exception:
                 pass  # Not a campaign message, that's fine
 
