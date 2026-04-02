@@ -1717,9 +1717,19 @@ async def greetings_upload(request: Request, background_tasks: BackgroundTasks):
     Creates a campaign and auto-starts it.
     """
     import io
-    from openpyxl import load_workbook
+    import traceback
 
-    form = await request.form()
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl not installed on server")
+
+    try:
+        form = await request.form()
+    except Exception as e:
+        logger.error(f"Greetings upload: form parse error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read form data: {e}")
+
     file = form.get("file")
     if not file:
         raise HTTPException(status_code=400, detail="No file uploaded")
@@ -1728,74 +1738,106 @@ async def greetings_upload(request: Request, background_tasks: BackgroundTasks):
     if not filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="Only .xlsx files are accepted")
 
-    content = await file.read()
+    try:
+        content = await file.read()
+    except Exception as e:
+        logger.error(f"Greetings upload: file read error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+
     # Security: limit file size to 10 MB
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
+
+    logger.info(f"Greetings upload: {filename} ({len(content)} bytes)")
+
     try:
         wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         ws = wb.active
     except Exception as e:
+        logger.error(f"Greetings upload: Excel parse error: {e}")
         raise HTTPException(status_code=400, detail=f"Cannot read Excel file: {e}")
 
-    # Find column indices by header name
-    headers = {}
-    for idx, cell in enumerate(next(ws.iter_rows(min_row=1, max_row=1, values_only=False))):
-        val = str(cell.value or "").strip().lower()
-        headers[val] = idx
+    try:
+        # Find column indices by header name
+        headers = {}
+        first_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+        if not first_row or not first_row[0]:
+            wb.close()
+            raise HTTPException(status_code=400, detail="Excel file is empty or has no header row")
 
-    # Map expected columns (flexible naming)
-    name_col = None
-    phone_col = None
-    image_col = None
-    for key in ("name", "naam"):
-        if key in headers:
-            name_col = headers[key]
-            break
-    for key in ("phone", "mobile", "phone number", "mobile number", "mob"):
-        if key in headers:
-            phone_col = headers[key]
-            break
-    for key in ("image_url", "image", "link", "image link", "photo", "photo url"):
-        if key in headers:
-            image_col = headers[key]
-            break
+        for idx, val in enumerate(first_row[0]):
+            if val is not None:
+                headers[str(val).strip().lower()] = idx
 
-    if phone_col is None:
-        raise HTTPException(status_code=400, detail="Excel must have a 'phone' or 'mobile' column")
+        logger.info(f"Greetings upload: headers found: {list(headers.keys())}")
 
-    # Parse rows
-    records = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        phone_val = row[phone_col] if phone_col < len(row) else None
-        if not phone_val:
-            continue
-        # Handle Excel storing phone as number (float)
-        phone_str = str(int(phone_val)) if isinstance(phone_val, float) else str(phone_val)
-        phone_str = phone_str.strip()
+        # Map expected columns (flexible naming)
+        name_col = None
+        phone_col = None
+        image_col = None
+        for key in ("name", "naam"):
+            if key in headers:
+                name_col = headers[key]
+                break
+        for key in ("phone", "mobile", "phone number", "mobile number", "mob"):
+            if key in headers:
+                phone_col = headers[key]
+                break
+        for key in ("image_url", "image", "link", "image link", "photo", "photo url"):
+            if key in headers:
+                image_col = headers[key]
+                break
 
-        name_val = ""
-        if name_col is not None and name_col < len(row) and row[name_col]:
-            name_val = str(row[name_col]).strip()
+        if phone_col is None:
+            wb.close()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Excel must have a 'phone' or 'mobile' column. Found columns: {list(headers.keys())}",
+            )
 
-        image_url = ""
-        if image_col is not None and image_col < len(row) and row[image_col]:
-            image_url = str(row[image_col]).strip()
+        # Parse rows
+        records = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row or phone_col >= len(row):
+                continue
+            phone_val = row[phone_col]
+            if not phone_val:
+                continue
+            # Handle Excel storing phone as number (float/int)
+            if isinstance(phone_val, (float, int)):
+                phone_str = str(int(phone_val))
+            else:
+                phone_str = str(phone_val).strip()
 
-        record = {"phone": phone_str, "name": name_val}
-        if image_url:
-            record["extra_data"] = {"image_url": image_url}
-        records.append(record)
+            name_val = ""
+            if name_col is not None and name_col < len(row) and row[name_col]:
+                name_val = str(row[name_col]).strip()
 
-    wb.close()
+            image_url = ""
+            if image_col is not None and image_col < len(row) and row[image_col]:
+                image_url = str(row[image_col]).strip()
+
+            record = {"phone": phone_str, "name": name_val}
+            if image_url:
+                record["extra_data"] = {"image_url": image_url}
+            records.append(record)
+
+        wb.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Greetings upload: row parsing error: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Error parsing Excel rows: {e}")
 
     if not records:
         raise HTTPException(status_code=400, detail="No valid records found in Excel")
 
+    logger.info(f"Greetings upload: parsed {len(records)} records")
+
     # Get template name and language from form or use defaults
-    template_name = form.get("template_name", "shubhkamnaye") or "shubhkamnaye"
-    language = form.get("language", "hi") or "hi"
-    campaign_name = form.get("campaign_name") or f"Greetings - {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')}"
+    template_name = str(form.get("template_name") or "shubhkamnaye").strip() or "shubhkamnaye"
+    language = str(form.get("language") or "hi").strip() or "hi"
+    campaign_name = str(form.get("campaign_name") or "").strip() or f"Greetings - {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')}"
 
     rate_limit = int(os.getenv("CAMPAIGN_RATE_LIMIT", "100"))
 
