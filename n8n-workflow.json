@@ -1,5 +1,5 @@
 {
-  "name": "WhatsApp → IFS Platform (Unified)",
+  "name": "WhatsApp → Gunayatan Platform",
   "nodes": [
     {
       "parameters": {
@@ -15,7 +15,7 @@
         0
       ],
       "id": "a75aa56f-e9af-4c78-9973-80533c4319de",
-      "name": "Webhook-post Request",
+      "name": "WhatsApp Webhook",
       "webhookId": "6101fd3e-f320-4ce6-8f33-e9bc46749fe6"
     },
     {
@@ -32,18 +32,18 @@
         0
       ],
       "id": "8919158c-ffec-4424-8464-4324e35dda5a",
-      "name": "Respond 200"
+      "name": "Respond 200 to Meta"
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "https://wb.ifsjaipur.cloud/webhook/whatsapp",
+        "url": "https://wb.gunayatan.org/webhook/whatsapp",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "X-Webhook-Secret",
-              "value": "YOUR_WEBHOOK_SECRET_HERE"
+              "value": "123456"
             },
             {
               "name": "Content-Type",
@@ -53,7 +53,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify($('Webhook-post Request').item.json.body) }}",
+        "jsonBody": "={{ JSON.stringify($('WhatsApp Webhook').item.json.body) }}",
         "options": {
           "timeout": 30000,
           "ignore_ssl_issues": false
@@ -65,27 +65,27 @@
         200,
         0
       ],
-      "id": "fwd-to-ifs-platform",
-      "name": "Forward to IFS Platform"
+      "id": "fwd-to-gunayatan",
+      "name": "Forward to Gunayatan"
     }
   ],
   "connections": {
-    "Webhook-post Request": {
+    "WhatsApp Webhook": {
       "main": [
         [
           {
-            "node": "Respond 200",
+            "node": "Respond 200 to Meta",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Respond 200": {
+    "Respond 200 to Meta": {
       "main": [
         [
           {
-            "node": "Forward to IFS Platform",
+            "node": "Forward to Gunayatan",
             "type": "main",
             "index": 0
           }

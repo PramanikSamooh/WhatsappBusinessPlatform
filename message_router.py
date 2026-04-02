@@ -20,6 +20,7 @@ from loguru import logger
 from campaign_db import update_recipient_by_wamid
 from chat_db import add_message, get_or_create_conversation, update_message_status
 from chatbot import handle_text_message
+from chatwoot import forward_incoming_to_chatwoot_bg
 from contacts_db import get_or_create_contact
 from orders import process_incoming_order
 import media_storage
@@ -94,6 +95,9 @@ async def route_webhook(body: dict, knowledge_context: str) -> dict:
                 f"Router: {msg_type} from {sender_phone} ({sender_name}) "
                 f"[contact={contact_id}, ai={'on' if ai_enabled else 'off'}]"
             )
+
+            # Forward incoming message to Chatwoot (fire-and-forget)
+            forward_incoming_to_chatwoot_bg(body)
 
             # Route by message type
             if msg_type == "text":

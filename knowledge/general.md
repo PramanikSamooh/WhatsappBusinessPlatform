@@ -1,27 +1,30 @@
-# About Institute of Financial Studies (IFS)
+# About Gunayatan
 
 ## Overview
-<!-- TODO: Fill with actual IFS details -->
-Institute of Financial Studies (IFS) is a premier financial education institute based in Jaipur, Rajasthan.
+Gunayatan is a Jain religious and spiritual centre dedicated to the propagation of Jain values, education, and dharma under the Aashirwaad of 108 Muni Pramansagar Ji Maharaaj (Digambar Jain Saint, disciple of Param Pujya Aacharya Vidyasagar Ji Maharaaj).
 
 ## Location
 <!-- TODO: Fill with actual address -->
-Address: [Your full address here]
-City: Jaipur, Rajasthan
-Pin: [Pin code]
+Gunayatan, Shikharji
+Address: [Full address]
+State: Jharkhand
 
 ## Contact
-Phone: +91 78913 93505
+Phone: +91 98293 93505
 <!-- TODO: Add more contact details -->
 Email: [Your email]
-Website: [Your website]
+Website: gunayatan.org
 
-## Office Hours
+## Timings
 <!-- TODO: Fill actual timings -->
-Monday to Saturday: 10:00 AM - 6:00 PM
-Sunday: Closed
+Darshan Timings: [Morning and evening timings]
+Office Hours: [Office hours]
 
 ## Social Media
 <!-- TODO: Add links -->
+YouTube: [handle]
 Instagram: [handle]
-LinkedIn: [handle]
+Facebook: [handle]
+
+## About Muni Pramansagar Ji Maharaaj
+108 Muni Pramansagar Ji Maharaaj is a revered Digambar Jain Saint and disciple of Param Pujya Aacharya Vidyasagar Ji Maharaaj. Under their Aashirwaad, Gunayatan serves the Jain community through spiritual guidance, education, and dharmic activities.

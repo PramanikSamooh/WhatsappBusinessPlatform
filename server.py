@@ -113,6 +113,7 @@ SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "")
 
 # Security config
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+GREETINGS_PASSWORD = os.getenv("GREETINGS_PASSWORD", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 SESSION_EXPIRY_HOURS = 24
 
@@ -235,6 +236,59 @@ async def require_auth_csrf(
     if request.method in ("POST", "PATCH", "PUT", "DELETE"):
         header_csrf = request.headers.get("X-CSRF-Token", "")
         if not csrf_token or not header_csrf or csrf_token != header_csrf:
+            raise HTTPException(status_code=403, detail="CSRF token mismatch")
+
+
+# --- Greetings auth (separate session store, isolated from dashboard) ---
+
+greetings_sessions: dict[str, datetime] = {}
+
+
+def create_greetings_session() -> str:
+    """Create a greetings session token."""
+    token = secrets.token_urlsafe(32)
+    greetings_sessions[token] = datetime.now(timezone.utc) + timedelta(hours=SESSION_EXPIRY_HOURS)
+    now = datetime.now(timezone.utc)
+    expired = [t for t, exp in greetings_sessions.items() if exp < now]
+    for t in expired:
+        del greetings_sessions[t]
+    return token
+
+
+def verify_greetings_session(token: str) -> bool:
+    """Check if a greetings session token is valid."""
+    if not token or token not in greetings_sessions:
+        return False
+    if greetings_sessions[token] < datetime.now(timezone.utc):
+        del greetings_sessions[token]
+        return False
+    return True
+
+
+async def require_greetings_auth(
+    greetings_session: str = Cookie(default=""),
+):
+    """FastAPI dependency for greetings page auth."""
+    if not GREETINGS_PASSWORD:
+        return
+    if verify_greetings_session(greetings_session):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def require_greetings_auth_csrf(
+    request: Request,
+    greetings_session: str = Cookie(default=""),
+    greetings_csrf: str = Cookie(default=""),
+):
+    """Greetings auth + CSRF for mutating endpoints."""
+    if not GREETINGS_PASSWORD:
+        return
+    if not verify_greetings_session(greetings_session):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if request.method in ("POST", "PATCH", "PUT", "DELETE"):
+        header_csrf = request.headers.get("X-CSRF-Token", "")
+        if not greetings_csrf or not header_csrf or greetings_csrf != header_csrf:
             raise HTTPException(status_code=403, detail="CSRF token mismatch")
 
 
@@ -1492,6 +1546,209 @@ async def rename_knowledge_file(filename: str, request: Request):
     old_path.rename(new_path)
     logger.info(f"Knowledge file renamed: {filename} -> {new_name}")
     return {"status": "renamed", "old_name": filename, "new_name": new_name}
+
+
+# --- Greetings Staff Page ---
+
+
+@app.get("/greetings")
+async def greetings_page():
+    """Serve the greetings staff page."""
+    greetings_path = STATIC_DIR / "greetings.html"
+    if not greetings_path.exists():
+        raise HTTPException(status_code=404, detail="Greetings page not found")
+    return FileResponse(str(greetings_path), media_type="text/html")
+
+
+@app.post("/auth/greetings-login")
+async def greetings_login(request: Request):
+    """Login for greetings staff page."""
+    if not GREETINGS_PASSWORD:
+        return JSONResponse({"status": "ok", "message": "Auth disabled"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    password = body.get("password", "")
+    if password != GREETINGS_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    token = create_greetings_session()
+    csrf_token = secrets.token_urlsafe(32)
+    response = JSONResponse({"status": "ok", "csrf_token": csrf_token})
+    response.set_cookie(
+        key="greetings_session",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=SESSION_EXPIRY_HOURS * 3600,
+    )
+    response.set_cookie(
+        key="greetings_csrf",
+        value=csrf_token,
+        httponly=False,
+        secure=True,
+        samesite="strict",
+        max_age=SESSION_EXPIRY_HOURS * 3600,
+    )
+    logger.info("Greetings staff login successful")
+    return response
+
+
+@app.get("/auth/greetings-check")
+async def greetings_auth_check(greetings_session: str = Cookie(default="")):
+    """Check if greetings session is valid."""
+    if not GREETINGS_PASSWORD:
+        return {"authenticated": True, "auth_required": False}
+    if verify_greetings_session(greetings_session):
+        return {"authenticated": True, "auth_required": True}
+    return JSONResponse({"authenticated": False, "auth_required": True}, status_code=401)
+
+
+@app.post("/auth/greetings-logout")
+async def greetings_logout(greetings_session: str = Cookie(default="")):
+    """Logout greetings staff session."""
+    if greetings_session in greetings_sessions:
+        del greetings_sessions[greetings_session]
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie("greetings_session")
+    return response
+
+
+@app.post("/api/greetings/upload", dependencies=[Depends(require_greetings_auth_csrf)])
+async def greetings_upload(request: Request, background_tasks: BackgroundTasks):
+    """Upload Excel file for greeting campaign.
+
+    Expects multipart form with an .xlsx file.
+    Columns: name, phone/mobile, image_url/image/link
+    Creates a campaign and auto-starts it.
+    """
+    import io
+    from openpyxl import load_workbook
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    filename = getattr(file, "filename", "")
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are accepted")
+
+    content = await file.read()
+    try:
+        wb = load_workbook(io.BytesIO(content), read_only=True)
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read Excel file: {e}")
+
+    # Find column indices by header name
+    headers = {}
+    for idx, cell in enumerate(next(ws.iter_rows(min_row=1, max_row=1, values_only=False))):
+        val = str(cell.value or "").strip().lower()
+        headers[val] = idx
+
+    # Map expected columns (flexible naming)
+    name_col = None
+    phone_col = None
+    image_col = None
+    for key in ("name", "naam"):
+        if key in headers:
+            name_col = headers[key]
+            break
+    for key in ("phone", "mobile", "phone number", "mobile number", "mob"):
+        if key in headers:
+            phone_col = headers[key]
+            break
+    for key in ("image_url", "image", "link", "image link", "photo", "photo url"):
+        if key in headers:
+            image_col = headers[key]
+            break
+
+    if phone_col is None:
+        raise HTTPException(status_code=400, detail="Excel must have a 'phone' or 'mobile' column")
+
+    # Parse rows
+    records = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        phone_val = row[phone_col] if phone_col < len(row) else None
+        if not phone_val:
+            continue
+        # Handle Excel storing phone as number (float)
+        phone_str = str(int(phone_val)) if isinstance(phone_val, float) else str(phone_val)
+        phone_str = phone_str.strip()
+
+        name_val = ""
+        if name_col is not None and name_col < len(row) and row[name_col]:
+            name_val = str(row[name_col]).strip()
+
+        image_url = ""
+        if image_col is not None and image_col < len(row) and row[image_col]:
+            image_url = str(row[image_col]).strip()
+
+        record = {"phone": phone_str, "name": name_val}
+        if image_url:
+            record["extra_data"] = {"image_url": image_url}
+        records.append(record)
+
+    wb.close()
+
+    if not records:
+        raise HTTPException(status_code=400, detail="No valid records found in Excel")
+
+    # Get template name and language from form or use defaults
+    template_name = form.get("template_name", "shubhkamnaye") or "shubhkamnaye"
+    language = form.get("language", "hi") or "hi"
+    campaign_name = form.get("campaign_name") or f"Greetings - {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')}"
+
+    rate_limit = int(os.getenv("CAMPAIGN_RATE_LIMIT", "100"))
+
+    # Create campaign
+    campaign = await create_campaign(
+        name=campaign_name,
+        template_name=template_name,
+        language=language,
+        rate_limit_per_min=rate_limit,
+        source="greetings",
+    )
+    campaign_id = campaign["id"]
+
+    # Add recipients
+    result = await add_recipients(campaign_id, records)
+
+    # Auto-start campaign
+    background_tasks.add_task(run_campaign, campaign_id)
+
+    return {
+        "status": "started",
+        "campaign_id": campaign_id,
+        "campaign_name": campaign_name,
+        "recipients": result,
+        "template": template_name,
+        "language": language,
+    }
+
+
+@app.get("/api/greetings/campaigns", dependencies=[Depends(require_greetings_auth)])
+async def greetings_list_campaigns(limit: int = 50):
+    """List greeting campaigns (filtered by source='greetings')."""
+    all_campaigns = await list_campaigns(limit=limit)
+    greeting_campaigns = [c for c in all_campaigns if c.get("source") == "greetings"]
+    return {"campaigns": greeting_campaigns, "count": len(greeting_campaigns)}
+
+
+@app.get("/api/greetings/campaigns/{campaign_id}", dependencies=[Depends(require_greetings_auth)])
+async def greetings_campaign_status(campaign_id: str):
+    """Get greeting campaign detail with recipient stats."""
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign["recipient_stats"] = await get_recipient_stats(campaign_id)
+    campaign["recipients"] = await list_recipients(campaign_id, limit=1000)
+    return campaign
 
 
 # --- Dashboard ---

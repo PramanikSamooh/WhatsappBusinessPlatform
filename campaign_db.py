@@ -47,6 +47,12 @@ async def init_campaign_tables():
             await db.commit()
         except Exception:
             pass  # Column already exists
+        # Migration: add source column for filtering (e.g., 'greetings')
+        try:
+            await db.execute("ALTER TABLE campaigns ADD COLUMN source TEXT DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
         await db.execute("""
             CREATE TABLE IF NOT EXISTS campaign_recipients (
                 id              TEXT PRIMARY KEY,
@@ -64,6 +70,12 @@ async def init_campaign_tables():
                 UNIQUE(campaign_id, phone)
             )
         """)
+        # Migration: add extra_data column for per-recipient data (e.g., image_url for greetings)
+        try:
+            await db.execute("ALTER TABLE campaign_recipients ADD COLUMN extra_data TEXT DEFAULT '{}'")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_recipients_campaign
             ON campaign_recipients(campaign_id, status)
@@ -90,6 +102,7 @@ async def create_campaign(
     template_category: str = "",
     template_params: list | None = None,
     rate_limit_per_min: int = 60,
+    source: str = "",
 ) -> dict:
     """Create a new campaign in draft status."""
     campaign_id = generate_id()
@@ -99,8 +112,8 @@ async def create_campaign(
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO campaigns (id, name, template_name, template_category, language, template_params,
-               rate_limit_per_min, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (campaign_id, name, template_name, template_category, language, params_json, rate_limit_per_min, now),
+               rate_limit_per_min, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (campaign_id, name, template_name, template_category, language, params_json, rate_limit_per_min, source, now),
         )
         await db.commit()
 
@@ -143,7 +156,7 @@ async def list_campaigns(limit: int = 100, status: str = "") -> list[dict]:
 _CAMPAIGN_ALLOWED_COLUMNS = {
     "name", "template_name", "template_category", "language", "template_params", "status",
     "recipient_count", "sent_count", "delivered_count", "read_count",
-    "failed_count", "rate_limit_per_min", "started_at", "completed_at",
+    "failed_count", "rate_limit_per_min", "started_at", "completed_at", "source",
 }
 
 
@@ -190,7 +203,8 @@ async def add_recipients(campaign_id: str, records: list[dict]) -> dict:
 
     Args:
         campaign_id: Campaign ID
-        records: List of dicts with keys: phone (required), name (optional)
+        records: List of dicts with keys: phone (required), name (optional),
+                 extra_data (optional dict, e.g. {"image_url": "..."})
 
     Returns:
         Dict with added, duplicate, invalid counts.
@@ -225,10 +239,12 @@ async def add_recipients(campaign_id: str, records: list[dict]) -> dict:
                 continue
 
             name = str(record.get("name", "")).strip()
+            extra = record.get("extra_data")
+            extra_json = json.dumps(extra, ensure_ascii=False) if isinstance(extra, dict) else "{}"
             recipient_id = generate_id()
             await db.execute(
-                "INSERT INTO campaign_recipients (id, campaign_id, phone, name) VALUES (?, ?, ?, ?)",
-                (recipient_id, campaign_id, phone, name),
+                "INSERT INTO campaign_recipients (id, campaign_id, phone, name, extra_data) VALUES (?, ?, ?, ?, ?)",
+                (recipient_id, campaign_id, phone, name, extra_json),
             )
             existing_phones.add(phone)
             added += 1

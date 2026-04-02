@@ -96,8 +96,17 @@ async def run_campaign(campaign_id: str) -> None:
                 phone = recipient["phone"]
                 name = recipient.get("name", "")
 
+                # Parse per-recipient extra data (e.g., image_url for greetings)
+                extra_data = {}
+                if recipient.get("extra_data"):
+                    import json as _json
+                    try:
+                        extra_data = _json.loads(recipient["extra_data"])
+                    except (ValueError, TypeError):
+                        pass
+
                 # Build template components with recipient-specific params
-                components = _build_components(template_params, name)
+                components = _build_components(template_params, name, extra_data)
 
                 try:
                     send_start = time.monotonic()
@@ -139,21 +148,36 @@ async def run_campaign(campaign_id: str) -> None:
         _running_campaigns.pop(campaign_id, None)
 
 
-def _build_components(template_params: list, recipient_name: str) -> list:
+def _build_components(
+    template_params: list,
+    recipient_name: str,
+    extra_data: dict | None = None,
+) -> list:
     """Build WhatsApp template components from parameter definitions.
 
     template_params is a list of parameter values (strings).
     {{name}} in values is replaced with the recipient's name.
+    extra_data may contain image_url for header image components.
     """
-    if not template_params:
-        return []
+    components = []
 
-    body_params = []
-    for param in template_params:
-        value = str(param).replace("{{name}}", recipient_name or "there")
-        body_params.append({"type": "text", "text": value})
+    # Header image (for greeting templates with image header)
+    if extra_data and extra_data.get("image_url"):
+        components.append({
+            "type": "header",
+            "parameters": [{
+                "type": "image",
+                "image": {"link": extra_data["image_url"]},
+            }],
+        })
 
-    if not body_params:
-        return []
+    # Body text params
+    if template_params:
+        body_params = []
+        for param in template_params:
+            value = str(param).replace("{{name}}", recipient_name or "there")
+            body_params.append({"type": "text", "text": value})
+        if body_params:
+            components.append({"type": "body", "parameters": body_params})
 
-    return [{"type": "body", "parameters": body_params}]
+    return components

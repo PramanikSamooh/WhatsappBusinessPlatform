@@ -19,6 +19,7 @@ from chat_db import (
     get_recent_messages,
     update_conversation,
 )
+from chatwoot import forward_ai_reply_to_chatwoot_bg
 from hooks import send_chat_summary
 from utils import detect_handoff, extract_topics
 from whatsapp_messaging import mark_message_as_read, send_whatsapp_text
@@ -94,8 +95,23 @@ async def handle_text_message(
     # 5. Load recent messages for context
     recent_messages = await get_recent_messages(conv_id, limit=10)
 
+    # 5b. Check for room/dharamshala query and augment knowledge
+    augmented_knowledge = knowledge_context
+    if _is_room_query(message_text):
+        try:
+            from sheets_lookup import lookup_room, format_room_info
+            room_info = await lookup_room(phone=sender_phone)
+            if room_info:
+                augmented_knowledge = (
+                    f"ROOM BOOKING DETAILS FOR THIS VISITOR:\n{format_room_info(room_info)}\n\n"
+                    + knowledge_context
+                )
+                logger.info(f"Room info found for {sender_phone}: room {room_info.get('room_number', '?')}")
+        except Exception as e:
+            logger.error(f"Room lookup failed: {e}")
+
     # 6. Call GPT-4o
-    reply_text = await _call_gpt4o(knowledge_context, recent_messages)
+    reply_text = await _call_gpt4o(augmented_knowledge, recent_messages)
 
     # 7. Store assistant reply
     await add_message(conv_id, "assistant", reply_text, direction="outbound", source="ai")
@@ -104,6 +120,9 @@ async def handle_text_message(
     sent = await send_whatsapp_text(sender_phone, reply_text)
     if not sent:
         logger.error(f"Failed to send reply to {sender_phone}")
+
+    # 8b. Forward AI reply to Chatwoot (fire-and-forget)
+    forward_ai_reply_to_chatwoot_bg(sender_phone, reply_text)
 
     # 9. Run handoff detection + topic extraction
     all_messages = await get_recent_messages(conv_id, limit=50)
@@ -171,3 +190,18 @@ async def _call_gpt4o(knowledge_context: str, messages: list[dict]) -> str:
     except Exception as e:
         logger.error(f"GPT-4o call failed: {e}")
         return FALLBACK_MESSAGE
+
+
+# Room/dharamshala query keywords (Hindi + English)
+_ROOM_KEYWORDS = [
+    "room", "kamra", "kamre", "dharamshala", "dharmshala", "dharmsala",
+    "booking", "check-in", "check in", "checkin", "check-out", "check out", "checkout",
+    "mera room", "room number", "room no", "room kahan", "room konsa",
+    "accommodation", "stay", "rehna", "theharna", "kahan rukna",
+]
+
+
+def _is_room_query(text: str) -> bool:
+    """Check if the message is asking about room/dharamshala details."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _ROOM_KEYWORDS)
