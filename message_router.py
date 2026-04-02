@@ -28,6 +28,19 @@ from whatsapp_messaging import download_whatsapp_media, mark_message_as_read, se
 
 SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "")
 
+# Global AI toggle — can be changed at runtime via /api/settings/ai endpoint
+_global_ai_enabled = os.getenv("AI_ENABLED", "true").lower() in ("true", "1", "yes")
+
+
+def is_global_ai_enabled() -> bool:
+    return _global_ai_enabled
+
+
+def set_global_ai_enabled(enabled: bool) -> None:
+    global _global_ai_enabled
+    _global_ai_enabled = enabled
+    logger.info(f"Global AI {'ENABLED' if enabled else 'DISABLED'}")
+
 
 async def route_webhook(body: dict, knowledge_context: str) -> dict:
     """Parse a WhatsApp webhook body and route to the correct handler.
@@ -149,7 +162,7 @@ async def _handle_text(
     if not message_text:
         return {"action": "skipped", "reason": "empty text"}
 
-    if ai_enabled:
+    if ai_enabled and _global_ai_enabled:
         # AI chatbot handles the full flow (store, reply, handoff detection)
         await handle_text_message(
             sender_phone=sender_phone,

@@ -84,7 +84,7 @@ from campaign_db import (
 from campaign_runner import is_campaign_running, request_pause, run_campaign
 from db import complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
 from knowledge import KNOWLEDGE_DIR, load_knowledge
-from message_router import route_webhook
+from message_router import is_global_ai_enabled, route_webhook, set_global_ai_enabled
 from orders import handle_razorpay_webhook
 from orders_db import get_order, get_order_stats, list_orders as list_orders_db
 from whatsapp_messaging import (
@@ -399,6 +399,33 @@ async def get_branding():
         "business_city": BUSINESS_CITY,
         "support_phone": SUPPORT_PHONE,
     }
+
+
+@app.get("/api/settings/ai", dependencies=[Depends(require_auth)])
+async def get_ai_status():
+    """Get global AI chatbot status."""
+    return {"ai_enabled": is_global_ai_enabled()}
+
+
+@app.post("/api/settings/ai", dependencies=[Depends(require_auth_csrf)])
+async def toggle_ai_global(request: Request):
+    """Toggle global AI chatbot on/off for the entire system.
+
+    Body: { "enabled": true/false }
+    When disabled, all incoming messages go to Chatwoot only (no AI replies).
+    Per-contact ai_enabled settings are preserved but overridden by this global toggle.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    enabled = body.get("enabled")
+    if enabled is None:
+        raise HTTPException(status_code=400, detail="'enabled' field is required")
+
+    set_global_ai_enabled(bool(enabled))
+    return {"ai_enabled": is_global_ai_enabled()}
 
 
 # Mount static files for dashboard (login page is always accessible,
