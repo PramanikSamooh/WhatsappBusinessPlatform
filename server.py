@@ -1902,6 +1902,39 @@ async def greetings_start_campaign(campaign_id: str, background_tasks: Backgroun
     return {"status": "starting", "campaign_id": campaign_id}
 
 
+@app.post("/api/greetings/drive-folder", dependencies=[Depends(require_greetings_auth_csrf)])
+async def greetings_drive_folder(request: Request):
+    """List images from a Google Drive folder for greeting campaign.
+
+    Body: { "folder_id": "1abc..." }
+    Returns list of images with URLs ready for WhatsApp template headers.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    folder_id = body.get("folder_id", "").strip()
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="folder_id is required")
+
+    try:
+        from gdrive import list_folder_images, DRIVE_CONFIGURED
+        if not DRIVE_CONFIGURED:
+            raise HTTPException(status_code=500, detail="Google Drive not configured. Set GOOGLE_SHEETS_CREDENTIALS_JSON env var.")
+        images = await list_folder_images(folder_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Drive folder listing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list folder: {e}")
+
+    if not images:
+        raise HTTPException(status_code=400, detail="No image files found in the folder. Make sure the folder contains .jpg/.png files and is shared with the service account.")
+
+    return {"images": images, "count": len(images)}
+
+
 @app.delete("/api/greetings/campaigns/{campaign_id}/delete", dependencies=[Depends(require_greetings_auth_csrf)])
 async def greetings_delete_campaign(campaign_id: str):
     """Delete a greeting campaign (only draft/completed/failed)."""

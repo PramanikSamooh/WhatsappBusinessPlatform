@@ -16,6 +16,8 @@
         .badge-running { background: #dbeafe; color: #1e40af; }
         .badge-completed { background: #dcfce7; color: #166534; }
         .badge-paused { background: #fef3c7; color: #92400e; }
+        .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; font-weight: 600; }
+        .img-thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -45,61 +47,122 @@
             <button onclick="doLogout()" class="text-sm text-gray-500 hover:text-red-500">Logout</button>
         </header>
 
-        <div class="max-w-4xl mx-auto p-4 space-y-6">
+        <div class="max-w-5xl mx-auto p-4 space-y-6">
             <!-- Upload Section -->
             <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-                <h2 class="text-lg font-semibold mb-4">Upload Greetings</h2>
-                <p class="text-sm text-gray-500 mb-4">
-                    Upload an Excel file (.xlsx) with columns: <strong>Name</strong>, <strong>Phone/Mobile</strong>, <strong>Image URL/Link</strong>
-                </p>
+                <h2 class="text-lg font-semibold mb-3">Create Greeting Campaign</h2>
+
+                <!-- Tabs: Drive / Excel -->
+                <div class="flex gap-4 border-b mb-4">
+                    <button onclick="switchUploadTab('drive')" id="tab-drive" class="px-3 py-2 text-sm tab-active">Google Drive Folder</button>
+                    <button onclick="switchUploadTab('excel')" id="tab-excel" class="px-3 py-2 text-sm text-gray-500 hover:text-gray-700">Upload Excel</button>
+                </div>
+
                 <div id="uploadError" class="hidden bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm"></div>
                 <div id="uploadSuccess" class="hidden bg-green-50 text-green-700 p-3 rounded-lg mb-4 text-sm"></div>
 
-                <!-- Confirmation box (shown after upload, before sending) -->
-                <div id="confirmBox" class="hidden bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
-                    <p class="text-sm font-medium text-blue-800 mb-2" id="confirmText"></p>
-                    <div class="flex gap-3">
-                        <button onclick="doStartCampaign()" id="confirmSendBtn"
-                            class="bg-green-600 text-white rounded-lg px-5 py-2 text-sm font-medium hover:bg-green-700 transition">
-                            Send Now
-                        </button>
-                        <button onclick="cancelCampaign()"
-                            class="bg-gray-200 text-gray-700 rounded-lg px-5 py-2 text-sm font-medium hover:bg-gray-300 transition">
-                            Cancel
-                        </button>
+                <!-- Google Drive Tab -->
+                <div id="panel-drive">
+                    <div class="space-y-4">
+                        <div class="flex gap-3">
+                            <input type="text" id="driveFolderId" placeholder="Google Drive Folder ID"
+                                class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-1 focus:ring-blue-500 outline-none">
+                            <button onclick="loadDriveFolder()" id="driveLoadBtn"
+                                class="bg-blue-600 text-white rounded-lg px-5 py-2 text-sm font-medium hover:bg-blue-700 transition whitespace-nowrap">
+                                Load Images
+                            </button>
+                        </div>
+                        <p class="text-xs text-gray-400">Paste the folder ID from your Google Drive URL. The folder must be shared with the service account.</p>
+
+                        <!-- Images Table (shown after loading) -->
+                        <div id="driveImagesSection" class="hidden">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-sm font-medium text-gray-700" id="driveImageCount"></span>
+                            </div>
+                            <div class="overflow-x-auto border rounded-lg">
+                                <table class="w-full text-sm">
+                                    <thead class="bg-gray-50">
+                                        <tr class="text-left text-gray-500">
+                                            <th class="py-2 px-3 w-10">#</th>
+                                            <th class="py-2 px-3 w-16">Image</th>
+                                            <th class="py-2 px-3">File Name</th>
+                                            <th class="py-2 px-3">Phone Number</th>
+                                            <th class="py-2 px-3">Name</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="driveImagesBody"></tbody>
+                                </table>
+                            </div>
+                            <div class="mt-4 grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-medium text-gray-500 mb-1">Template Name</label>
+                                    <input type="text" id="driveTemplateName" value="shubhkamnaye"
+                                        class="w-full border rounded-lg px-3 py-2 text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium text-gray-500 mb-1">Campaign Name</label>
+                                    <input type="text" id="driveCampaignName" placeholder="Auto-generated if empty"
+                                        class="w-full border rounded-lg px-3 py-2 text-sm">
+                                </div>
+                            </div>
+                            <div class="mt-4 flex gap-3">
+                                <button onclick="createDriveCampaign()" id="driveCreateBtn"
+                                    class="bg-green-600 text-white rounded-lg px-6 py-2.5 text-sm font-medium hover:bg-green-700 transition">
+                                    Create & Send Campaign
+                                </button>
+                                <button onclick="clearDriveImages()"
+                                    class="bg-gray-200 text-gray-700 rounded-lg px-5 py-2 text-sm hover:bg-gray-300 transition">
+                                    Clear
+                                </button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
-                <form id="uploadForm" onsubmit="doUpload(event)" class="space-y-4">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1">Excel File</label>
-                        <input type="file" id="fileInput" accept=".xlsx,.xls" required
-                            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm file:mr-3 file:py-1 file:px-3 file:rounded-md file:border-0 file:bg-blue-50 file:text-blue-700 file:font-medium file:cursor-pointer">
+                <!-- Excel Tab -->
+                <div id="panel-excel" class="hidden">
+                    <p class="text-sm text-gray-500 mb-4">
+                        Upload an Excel file (.xlsx) with columns: <strong>Name</strong>, <strong>Phone/Mobile</strong>, <strong>Image URL/Link</strong>
+                    </p>
+                    <!-- Confirmation box -->
+                    <div id="confirmBox" class="hidden bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+                        <p class="text-sm font-medium text-blue-800 mb-2" id="confirmText"></p>
+                        <div class="flex gap-3">
+                            <button onclick="doStartCampaign()" id="confirmSendBtn"
+                                class="bg-green-600 text-white rounded-lg px-5 py-2 text-sm font-medium hover:bg-green-700 transition">Send Now</button>
+                            <button onclick="cancelCampaign()"
+                                class="bg-gray-200 text-gray-700 rounded-lg px-5 py-2 text-sm hover:bg-gray-300 transition">Cancel</button>
+                        </div>
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
+                    <form id="uploadForm" onsubmit="doUpload(event)" class="space-y-4">
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Template Name</label>
-                            <input type="text" id="templateName" value="shubhkamnaye"
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Excel File</label>
+                            <input type="file" id="fileInput" accept=".xlsx,.xls" required
+                                class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm file:mr-3 file:py-1 file:px-3 file:rounded-md file:border-0 file:bg-blue-50 file:text-blue-700 file:font-medium file:cursor-pointer">
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Template Name</label>
+                                <input type="text" id="templateName" value="shubhkamnaye"
+                                    class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Language</label>
+                                <select id="templateLang" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                    <option value="hi">Hindi</option>
+                                    <option value="en">English</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Campaign Name (optional)</label>
+                            <input type="text" id="campaignName" placeholder="Auto-generated if empty"
                                 class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
                         </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Language</label>
-                            <select id="templateLang" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
-                                <option value="hi">Hindi</option>
-                                <option value="en">English</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1">Campaign Name (optional)</label>
-                        <input type="text" id="campaignName" placeholder="Auto-generated if empty"
-                            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
-                    </div>
-                    <button type="submit" id="uploadBtn"
-                        class="bg-blue-600 text-white rounded-lg px-6 py-2.5 font-medium hover:bg-blue-700 transition text-sm">
-                        Upload
-                    </button>
-                </form>
+                        <button type="submit" id="uploadBtn"
+                            class="bg-blue-600 text-white rounded-lg px-6 py-2.5 font-medium hover:bg-blue-700 transition text-sm">Upload</button>
+                    </form>
+                </div>
             </div>
 
             <!-- Campaigns List -->
@@ -143,52 +206,33 @@ let csrfToken = '';
 let refreshInterval = null;
 let activeCampaignId = null;
 let pendingCampaignId = null;
+let driveImages = []; // loaded from Drive
 
 function getCookie(name) {
     const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
     return m ? m[2] : '';
 }
-
-function fmtDate(dateStr) {
-    if (!dateStr) return '-';
-    // Handle SQLite dates (no Z suffix) and ISO dates
-    let d;
-    if (dateStr.includes('T')) {
-        d = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z');
-    } else {
-        d = new Date(dateStr + 'Z');
-    }
-    if (isNaN(d.getTime())) return '-';
-    return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+function fmtDate(d) {
+    if (!d) return '-';
+    const dt = new Date(d.includes('T') ? (d.endsWith('Z') ? d : d+'Z') : d+'Z');
+    return isNaN(dt) ? '-' : dt.toLocaleString('en-IN', {timeZone:'Asia/Kolkata', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'});
 }
-
-function fmtTime(dateStr) {
-    if (!dateStr) return '-';
-    let d;
-    if (dateStr.includes('T')) {
-        d = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z');
-    } else {
-        d = new Date(dateStr + 'Z');
-    }
-    if (isNaN(d.getTime())) return '-';
-    return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+function fmtTime(d) {
+    if (!d) return '-';
+    const dt = new Date(d.includes('T') ? (d.endsWith('Z') ? d : d+'Z') : d+'Z');
+    return isNaN(dt) ? '-' : dt.toLocaleString('en-IN', {timeZone:'Asia/Kolkata', hour:'2-digit', minute:'2-digit'});
 }
-
-function shortError(err) {
-    if (!err) return '';
-    // Extract short error description from Meta error format
-    // [131049] This message was not delivered... → "Ecosystem limit"
-    // [131026] Message undeliverable... → "Not on WhatsApp"
-    // [131047] Re-engagement required... → "Re-engagement needed"
-    if (err.includes('131049')) return 'Ecosystem limit';
-    if (err.includes('131026')) return 'Not on WhatsApp';
-    if (err.includes('131047')) return 'Re-engagement needed';
-    if (err.includes('131053')) return 'Media error';
-    if (err.includes('130472')) return 'Template paused';
-    if (err.includes('132000')) return 'Param mismatch';
-    // Fallback: first 40 chars
-    return err.length > 40 ? err.substring(0, 40) + '...' : err;
+function shortError(e) {
+    if (!e) return '';
+    if (e.includes('131049')) return 'Ecosystem limit';
+    if (e.includes('131026')) return 'Not on WhatsApp';
+    if (e.includes('131047')) return 'Re-engagement needed';
+    if (e.includes('131053')) return 'Media error';
+    if (e.includes('130472')) return 'Template paused';
+    if (e.includes('132000')) return 'Param mismatch';
+    return e.length > 40 ? e.substring(0,40)+'...' : e;
 }
+function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
 
 async function api(url, opts = {}) {
     const headers = opts.headers || {};
@@ -203,63 +247,196 @@ function showLogin() {
     document.getElementById('appScreen').classList.add('hidden');
     if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
 }
-
 function showApp() {
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('appScreen').classList.remove('hidden');
     loadCampaigns();
 }
-
 async function checkAuth() {
     try {
-        const resp = await fetch('/auth/greetings-check', { credentials: 'include' });
-        const data = await resp.json();
-        if (data.authenticated) { csrfToken = getCookie('greetings_csrf'); showApp(); }
-        else showLogin();
+        const r = await fetch('/auth/greetings-check', {credentials:'include'});
+        const d = await r.json();
+        if (d.authenticated) { csrfToken = getCookie('greetings_csrf'); showApp(); } else showLogin();
     } catch { showLogin(); }
 }
-
 async function doLogin() {
     const pw = document.getElementById('loginPassword').value;
-    const errEl = document.getElementById('loginError');
-    errEl.classList.add('hidden');
+    const err = document.getElementById('loginError');
+    err.classList.add('hidden');
     try {
-        const resp = await fetch('/auth/greetings-login', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password: pw }), credentials: 'include',
+        const r = await fetch('/auth/greetings-login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pw}), credentials:'include'});
+        if (r.ok) { const d = await r.json(); csrfToken = getCookie('greetings_csrf') || d.csrf_token; showApp(); }
+        else { err.textContent = r.status===429 ? 'Too many attempts. Wait 10 minutes.' : 'Invalid password'; err.classList.remove('hidden'); }
+    } catch(e) { err.textContent = 'Login failed: '+e.message; err.classList.remove('hidden'); }
+}
+async function doLogout() { await fetch('/auth/greetings-logout',{method:'POST',credentials:'include'}); showLogin(); }
+
+// --- Tab switching ---
+function switchUploadTab(tab) {
+    document.getElementById('panel-drive').classList.toggle('hidden', tab !== 'drive');
+    document.getElementById('panel-excel').classList.toggle('hidden', tab !== 'excel');
+    document.getElementById('tab-drive').classList.toggle('tab-active', tab === 'drive');
+    document.getElementById('tab-excel').classList.toggle('tab-active', tab === 'excel');
+    document.getElementById('tab-drive').classList.toggle('text-gray-500', tab !== 'drive');
+    document.getElementById('tab-excel').classList.toggle('text-gray-500', tab !== 'excel');
+}
+
+// --- Google Drive Flow ---
+async function loadDriveFolder() {
+    const folderId = document.getElementById('driveFolderId').value.trim();
+    if (!folderId) { alert('Please enter a folder ID'); return; }
+
+    const btn = document.getElementById('driveLoadBtn');
+    const errEl = document.getElementById('uploadError');
+    errEl.classList.add('hidden');
+    btn.disabled = true; btn.textContent = 'Loading...';
+
+    try {
+        const resp = await api('/api/greetings/drive-folder', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({folder_id: folderId}),
         });
-        if (resp.ok) {
-            const data = await resp.json();
-            csrfToken = getCookie('greetings_csrf') || data.csrf_token;
-            showApp();
-        } else {
-            errEl.textContent = resp.status === 429 ? 'Too many attempts. Wait 10 minutes.' : 'Invalid password';
-            errEl.classList.remove('hidden');
-        }
-    } catch (e) { errEl.textContent = 'Login failed: ' + e.message; errEl.classList.remove('hidden'); }
+        const data = await resp.json();
+        if (!resp.ok) { errEl.textContent = data.detail || 'Failed to load folder'; errEl.classList.remove('hidden'); return; }
+
+        driveImages = data.images || [];
+        document.getElementById('driveImageCount').textContent = `${driveImages.length} images found`;
+
+        const tbody = document.getElementById('driveImagesBody');
+        tbody.innerHTML = driveImages.map((img, i) => `
+            <tr class="border-b border-gray-100">
+                <td class="py-2 px-3 text-gray-400">${i+1}</td>
+                <td class="py-2 px-3">
+                    <img src="${esc(img.thumbnail || img.image_url)}" class="img-thumb" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2248%22 height=%2248%22><rect fill=%22%23e5e7eb%22 width=%2248%22 height=%2248%22/><text x=%2224%22 y=%2228%22 text-anchor=%22middle%22 fill=%22%239ca3af%22 font-size=%2212%22>?</text></svg>'">
+                </td>
+                <td class="py-2 px-3 text-xs text-gray-600">${esc(img.name)}</td>
+                <td class="py-2 px-3">
+                    <input type="text" class="drive-phone w-full border rounded px-2 py-1 text-sm" data-idx="${i}" placeholder="Phone number">
+                </td>
+                <td class="py-2 px-3">
+                    <input type="text" class="drive-name w-full border rounded px-2 py-1 text-sm" data-idx="${i}" placeholder="Name (optional)">
+                </td>
+            </tr>
+        `).join('');
+
+        document.getElementById('driveImagesSection').classList.remove('hidden');
+    } catch(e) {
+        errEl.textContent = 'Error: ' + e.message;
+        errEl.classList.remove('hidden');
+    } finally {
+        btn.disabled = false; btn.textContent = 'Load Images';
+    }
 }
 
-async function doLogout() {
-    await fetch('/auth/greetings-logout', { method: 'POST', credentials: 'include' });
-    showLogin();
+function clearDriveImages() {
+    driveImages = [];
+    document.getElementById('driveImagesSection').classList.add('hidden');
+    document.getElementById('driveImagesBody').innerHTML = '';
 }
 
+async function createDriveCampaign() {
+    const errEl = document.getElementById('uploadError');
+    const successEl = document.getElementById('uploadSuccess');
+    errEl.classList.add('hidden'); successEl.classList.add('hidden');
+
+    // Collect phone numbers from the table
+    const phoneInputs = document.querySelectorAll('.drive-phone');
+    const nameInputs = document.querySelectorAll('.drive-name');
+    const records = [];
+    let skipped = 0;
+
+    phoneInputs.forEach((input, i) => {
+        const phone = input.value.trim();
+        if (!phone) { skipped++; return; }
+        const name = nameInputs[i]?.value?.trim() || '';
+        const img = driveImages[i];
+        if (!img) return;
+        records.push({ phone, name, extra_data: { image_url: img.image_url } });
+    });
+
+    if (records.length === 0) {
+        errEl.textContent = 'Please enter at least one phone number';
+        errEl.classList.remove('hidden');
+        return;
+    }
+
+    if (!confirm(`Send greetings to ${records.length} recipients? (${skipped} rows skipped — no phone number)`)) return;
+
+    const btn = document.getElementById('driveCreateBtn');
+    btn.disabled = true; btn.textContent = 'Creating...';
+
+    const templateName = document.getElementById('driveTemplateName').value.trim() || 'shubhkamnaye';
+    const campaignName = document.getElementById('driveCampaignName').value.trim() || undefined;
+
+    try {
+        // Step 1: Create campaign via Excel upload endpoint (reuse) with JSON body
+        const formData = new FormData();
+
+        // Build a minimal Excel-like payload — actually, let's use the recipients API directly
+        // First create campaign
+        const cResp = await api('/api/campaigns', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                name: campaignName || `Greetings - ${new Date().toLocaleString('en-IN', {timeZone:'Asia/Kolkata', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'})}`,
+                template_name: templateName,
+                language: 'hi',
+                rate_limit_per_min: 100,
+            }),
+        });
+        if (!cResp.ok) { const d = await cResp.json().catch(()=>({})); throw new Error(d.detail || 'Failed to create campaign'); }
+        const campaign = await cResp.json();
+
+        // Mark as greetings source
+        await api(`/api/campaigns/${campaign.id}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ source: 'greetings' }),
+        });
+
+        // Step 2: Add recipients with extra_data
+        const rResp = await api(`/api/campaigns/${campaign.id}/recipients`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ recipients: records }),
+        });
+        if (!rResp.ok) { const d = await rResp.json().catch(()=>({})); throw new Error(d.detail || 'Failed to add recipients'); }
+
+        // Step 3: Start campaign
+        const sResp = await api(`/api/campaigns/${campaign.id}/start`, {
+            method: 'POST',
+        });
+        if (!sResp.ok) { const d = await sResp.json().catch(()=>({})); throw new Error(d.detail || 'Failed to start campaign'); }
+
+        successEl.textContent = `Campaign started! ${records.length} recipients.`;
+        successEl.classList.remove('hidden');
+        clearDriveImages();
+        document.getElementById('driveFolderId').value = '';
+        document.getElementById('driveCampaignName').value = '';
+        loadCampaigns();
+        showCampaignDetail(campaign.id);
+    } catch(e) {
+        errEl.textContent = 'Error: ' + e.message;
+        errEl.classList.remove('hidden');
+    } finally {
+        btn.disabled = false; btn.textContent = 'Create & Send Campaign';
+    }
+}
+
+// --- Excel Upload Flow ---
 async function doUpload(event) {
     event.preventDefault();
     const btn = document.getElementById('uploadBtn');
     const errEl = document.getElementById('uploadError');
     const successEl = document.getElementById('uploadSuccess');
     const confirmBox = document.getElementById('confirmBox');
-    errEl.classList.add('hidden');
-    successEl.classList.add('hidden');
-    confirmBox.classList.add('hidden');
+    errEl.classList.add('hidden'); successEl.classList.add('hidden'); confirmBox.classList.add('hidden');
 
     const fileInput = document.getElementById('fileInput');
     if (!fileInput.files.length) return;
 
-    btn.disabled = true;
-    btn.textContent = 'Uploading...';
-
+    btn.disabled = true; btn.textContent = 'Uploading...';
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
     formData.append('template_name', document.getElementById('templateName').value);
@@ -267,43 +444,34 @@ async function doUpload(event) {
     formData.append('campaign_name', document.getElementById('campaignName').value);
 
     try {
-        const resp = await api('/api/greetings/upload', { method: 'POST', body: formData });
+        const resp = await api('/api/greetings/upload', {method:'POST', body:formData});
         let data;
-        const ct = resp.headers.get('content-type') || '';
-        if (ct.includes('application/json')) { data = await resp.json(); }
-        else { const text = await resp.text(); data = { detail: text || `Server error (${resp.status})` }; }
+        const ct = resp.headers.get('content-type')||'';
+        if (ct.includes('application/json')) data = await resp.json();
+        else { const t = await resp.text(); data = {detail: t||`Server error (${resp.status})`}; }
 
         if (resp.ok) {
             pendingCampaignId = data.campaign_id;
-            const count = data.recipients?.added || 0;
-            document.getElementById('confirmText').textContent =
-                `${count} recipients loaded. Template: ${data.template || 'shubhkamnaye'}. Ready to send?`;
+            document.getElementById('confirmText').textContent = `${data.recipients?.added||0} recipients loaded. Template: ${data.template||'shubhkamnaye'}. Ready to send?`;
             confirmBox.classList.remove('hidden');
             loadCampaigns();
         } else {
             errEl.textContent = data.detail || `Upload failed (${resp.status})`;
             errEl.classList.remove('hidden');
         }
-    } catch (e) {
-        errEl.textContent = 'Upload error: ' + e.message;
-        errEl.classList.remove('hidden');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = 'Upload';
-    }
+    } catch(e) { errEl.textContent = 'Upload error: '+e.message; errEl.classList.remove('hidden'); }
+    finally { btn.disabled = false; btn.textContent = 'Upload'; }
 }
 
 async function doStartCampaign() {
     if (!pendingCampaignId) return;
     const btn = document.getElementById('confirmSendBtn');
-    btn.disabled = true;
-    btn.textContent = 'Starting...';
-
+    btn.disabled = true; btn.textContent = 'Starting...';
     try {
-        const resp = await api(`/api/greetings/campaigns/${pendingCampaignId}/start`, { method: 'POST' });
+        const resp = await api(`/api/greetings/campaigns/${pendingCampaignId}/start`, {method:'POST'});
         if (resp.ok) {
             document.getElementById('confirmBox').classList.add('hidden');
-            document.getElementById('uploadSuccess').textContent = 'Campaign started! Messages are being sent.';
+            document.getElementById('uploadSuccess').textContent = 'Campaign started!';
             document.getElementById('uploadSuccess').classList.remove('hidden');
             document.getElementById('fileInput').value = '';
             document.getElementById('campaignName').value = '';
@@ -311,44 +479,33 @@ async function doStartCampaign() {
             showCampaignDetail(pendingCampaignId);
             pendingCampaignId = null;
         } else {
-            const data = await resp.json().catch(() => ({}));
-            document.getElementById('uploadError').textContent = data.detail || 'Failed to start campaign';
+            const d = await resp.json().catch(()=>({}));
+            document.getElementById('uploadError').textContent = d.detail||'Failed to start';
             document.getElementById('uploadError').classList.remove('hidden');
         }
-    } catch (e) {
-        document.getElementById('uploadError').textContent = 'Start error: ' + e.message;
-        document.getElementById('uploadError').classList.remove('hidden');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = 'Send Now';
-    }
+    } catch(e) { document.getElementById('uploadError').textContent = 'Error: '+e.message; document.getElementById('uploadError').classList.remove('hidden'); }
+    finally { btn.disabled = false; btn.textContent = 'Send Now'; }
 }
 
 async function cancelCampaign() {
-    if (pendingCampaignId) {
-        try { await api(`/api/greetings/campaigns/${pendingCampaignId}/delete`, { method: 'DELETE' }); } catch {}
-        pendingCampaignId = null;
-    }
+    if (pendingCampaignId) { try { await api(`/api/greetings/campaigns/${pendingCampaignId}/delete`,{method:'DELETE'}); } catch{} pendingCampaignId = null; }
     document.getElementById('confirmBox').classList.add('hidden');
     loadCampaigns();
 }
 
+// --- Campaign List & Detail ---
 async function loadCampaigns() {
     try {
         const resp = await api('/api/greetings/campaigns');
         const data = await resp.json();
         const list = document.getElementById('campaignsList');
-
-        if (!data.campaigns || data.campaigns.length === 0) {
-            list.innerHTML = '<p class="text-gray-400 text-sm">No greeting campaigns yet. Upload an Excel file to get started.</p>';
-            return;
-        }
+        if (!data.campaigns?.length) { list.innerHTML = '<p class="text-gray-400 text-sm">No greeting campaigns yet.</p>'; return; }
 
         list.innerHTML = data.campaigns.map(c => {
-            const total = c.recipient_count || 0;
-            const sent = (c.sent_count || 0) + (c.delivered_count || 0) + (c.read_count || 0);
-            const failed = c.failed_count || 0;
-            const canDelete = c.status !== 'running';
+            const total = c.recipient_count||0;
+            const sent = (c.sent_count||0)+(c.delivered_count||0)+(c.read_count||0);
+            const failed = c.failed_count||0;
+            const canDel = c.status !== 'running';
             return `
                 <div class="border border-gray-200 rounded-lg p-4 hover:bg-gray-50 transition">
                     <div class="flex items-center justify-between">
@@ -358,7 +515,7 @@ async function loadCampaigns() {
                         </div>
                         <div class="flex items-center gap-3">
                             <span class="text-xs text-gray-400">${fmtDate(c.created_at)}</span>
-                            ${canDelete ? `<button onclick="event.stopPropagation(); deleteCampaign('${c.id}', '${esc(c.name)}')" class="text-xs text-red-400 hover:text-red-600" title="Delete">&#10005;</button>` : ''}
+                            ${canDel ? `<button onclick="event.stopPropagation();deleteCampaign('${c.id}','${esc(c.name)}')" class="text-xs text-red-400 hover:text-red-600" title="Delete">&#10005;</button>` : ''}
                         </div>
                     </div>
                     <div class="mt-2 text-xs text-gray-500 cursor-pointer" onclick="showCampaignDetail('${c.id}')">
@@ -366,75 +523,49 @@ async function loadCampaigns() {
                     </div>
                 </div>`;
         }).join('');
-    } catch (e) { console.error('Load campaigns error:', e); }
+    } catch(e) { console.error('Load campaigns:',e); }
 }
 
-async function showCampaignDetail(campaignId) {
-    activeCampaignId = campaignId;
+async function deleteCampaign(id, name) {
+    if (!confirm(`Delete campaign "${name}"?`)) return;
+    try { await api(`/api/greetings/campaigns/${id}/delete`,{method:'DELETE'}); if (activeCampaignId===id) closeCampaignDetail(); loadCampaigns(); }
+    catch(e) { alert('Delete failed: '+e.message); }
+}
+
+async function showCampaignDetail(id) {
+    activeCampaignId = id;
     document.getElementById('campaignDetail').classList.remove('hidden');
     if (refreshInterval) clearInterval(refreshInterval);
-    refreshInterval = setInterval(() => refreshCampaignDetail(campaignId), 5000);
-    await refreshCampaignDetail(campaignId);
+    refreshInterval = setInterval(() => refreshCampaignDetail(id), 5000);
+    await refreshCampaignDetail(id);
 }
 
-async function refreshCampaignDetail(campaignId) {
+async function refreshCampaignDetail(id) {
     try {
-        const resp = await api(`/api/greetings/campaigns/${campaignId}`);
+        const resp = await api(`/api/greetings/campaigns/${id}`);
         const c = await resp.json();
-
-        document.getElementById('detailTitle').textContent = c.name || 'Campaign Detail';
-
-        const stats = c.recipient_stats || {};
+        document.getElementById('detailTitle').textContent = c.name || 'Campaign';
+        const s = c.recipient_stats || {};
         document.getElementById('detailStats').innerHTML = `
-            <div class="bg-gray-50 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-gray-800">${stats.total || 0}</div>
-                <div class="text-xs text-gray-500">Total</div>
-            </div>
-            <div class="bg-blue-50 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-blue-600">${stats.sent || 0}</div>
-                <div class="text-xs text-gray-500">Sent</div>
-            </div>
-            <div class="bg-yellow-50 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-yellow-600">${stats.delivered || 0}</div>
-                <div class="text-xs text-gray-500">Delivered</div>
-            </div>
-            <div class="bg-green-50 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-green-600">${stats.read || 0}</div>
-                <div class="text-xs text-gray-500">Read</div>
-            </div>
-            <div class="bg-red-50 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-red-600">${stats.failed || 0}</div>
-                <div class="text-xs text-gray-500">Failed</div>
-            </div>`;
+            <div class="bg-gray-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-gray-800">${s.total||0}</div><div class="text-xs text-gray-500">Total</div></div>
+            <div class="bg-blue-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-blue-600">${s.sent||0}</div><div class="text-xs text-gray-500">Sent</div></div>
+            <div class="bg-yellow-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-yellow-600">${s.delivered||0}</div><div class="text-xs text-gray-500">Delivered</div></div>
+            <div class="bg-green-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-green-600">${s.read||0}</div><div class="text-xs text-gray-500">Read</div></div>
+            <div class="bg-red-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-red-600">${s.failed||0}</div><div class="text-xs text-gray-500">Failed</div></div>`;
 
-        const recipients = c.recipients || [];
-        document.getElementById('detailRecipients').innerHTML = recipients.map(r => {
-            const errHtml = r.error_message
-                ? `<span class="text-red-500 text-xs" title="${esc(r.error_message)}">${esc(shortError(r.error_message))}</span>`
-                : '';
-            return `
-                <tr class="border-b border-gray-100">
-                    <td class="py-2 px-2">${esc(r.name || '-')}</td>
-                    <td class="py-2 px-2 font-mono text-xs">${esc(r.phone)}</td>
-                    <td class="py-2 px-2"><span class="badge badge-${r.status}">${r.status}</span></td>
-                    <td class="py-2 px-2 text-xs text-gray-500">${fmtTime(r.sent_at)}</td>
-                    <td class="py-2 px-2">${errHtml}</td>
-                </tr>`;
+        document.getElementById('detailRecipients').innerHTML = (c.recipients||[]).map(r => {
+            const errHtml = r.error_message ? `<span class="text-red-500 text-xs" title="${esc(r.error_message)}">${esc(shortError(r.error_message))}</span>` : '';
+            return `<tr class="border-b border-gray-100">
+                <td class="py-2 px-2">${esc(r.name||'-')}</td>
+                <td class="py-2 px-2 font-mono text-xs">${esc(r.phone)}</td>
+                <td class="py-2 px-2"><span class="badge badge-${r.status}">${r.status}</span></td>
+                <td class="py-2 px-2 text-xs text-gray-500">${fmtTime(r.sent_at)}</td>
+                <td class="py-2 px-2">${errHtml}</td>
+            </tr>`;
         }).join('');
 
-        if (c.status === 'completed' || c.status === 'failed') {
-            if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
-        }
-    } catch (e) { console.error('Refresh detail error:', e); }
-}
-
-async function deleteCampaign(campaignId, name) {
-    if (!confirm(`Delete campaign "${name}"?`)) return;
-    try {
-        await api(`/api/greetings/campaigns/${campaignId}/delete`, { method: 'DELETE' });
-        if (activeCampaignId === campaignId) closeCampaignDetail();
-        loadCampaigns();
-    } catch (e) { alert('Delete failed: ' + e.message); }
+        if (c.status==='completed'||c.status==='failed') { if (refreshInterval) { clearInterval(refreshInterval); refreshInterval=null; } }
+    } catch(e) { console.error('Refresh:',e); }
 }
 
 function closeCampaignDetail() {
@@ -442,8 +573,6 @@ function closeCampaignDetail() {
     activeCampaignId = null;
     if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
 }
-
-function esc(str) { const d = document.createElement('div'); d.textContent = str || ''; return d.innerHTML; }
 
 checkAuth();
 </script>
