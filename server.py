@@ -120,6 +120,40 @@ SESSION_EXPIRY_HOURS = 24
 
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "").lower() in ("production", "prod")
 
+# --- Brute force protection ---
+# Tracks failed login attempts per IP: {ip: [timestamp, timestamp, ...]}
+_login_attempts: dict[str, list[float]] = {}
+_MAX_LOGIN_ATTEMPTS = 10  # max attempts per window
+_LOGIN_WINDOW_SECONDS = 300  # 5 minute window
+_LOCKOUT_SECONDS = 600  # 10 minute lockout after exceeding
+
+
+def _check_brute_force(ip: str) -> None:
+    """Check if IP has exceeded login attempt limit. Raises 429 if locked out."""
+    import time as _time
+    now = _time.time()
+    attempts = _login_attempts.get(ip, [])
+    # Clean old attempts
+    attempts = [t for t in attempts if now - t < _LOCKOUT_SECONDS]
+    _login_attempts[ip] = attempts
+
+    if len(attempts) >= _MAX_LOGIN_ATTEMPTS:
+        oldest_in_window = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
+        if len(oldest_in_window) >= _MAX_LOGIN_ATTEMPTS:
+            logger.warning(f"Brute force blocked: {ip} ({len(attempts)} attempts)")
+            raise HTTPException(
+                status_code=429,
+                detail="Too many login attempts. Try again in 10 minutes.",
+            )
+
+
+def _record_failed_login(ip: str) -> None:
+    """Record a failed login attempt for brute force tracking."""
+    import time as _time
+    if ip not in _login_attempts:
+        _login_attempts[ip] = []
+    _login_attempts[ip].append(_time.time())
+
 if not all([WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID]):
     missing = [v for v, val in [
         ("WHATSAPP_TOKEN", WHATSAPP_TOKEN),
@@ -203,7 +237,7 @@ async def require_auth(
     # Check Bearer token (password-based for API access)
     if authorization.startswith("Bearer "):
         token = authorization[7:]
-        if token == DASHBOARD_PASSWORD:
+        if secrets.compare_digest(token, DASHBOARD_PASSWORD):
             return
 
     raise HTTPException(status_code=401, detail="Unauthorized")
@@ -226,7 +260,7 @@ async def require_auth_csrf(
     # Bearer token — no CSRF needed for API clients
     if authorization.startswith("Bearer "):
         token = authorization[7:]
-        if token == DASHBOARD_PASSWORD:
+        if secrets.compare_digest(token, DASHBOARD_PASSWORD):
             return
 
     # Session cookie auth
@@ -357,6 +391,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=APP_NAME, version="4.0.0", lifespan=lifespan)
 
+
+# --- Security headers middleware ---
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        if IS_PRODUCTION:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 # --- PWA routes (must come before static mount) ---
 
 
@@ -444,13 +497,17 @@ async def auth_login(request: Request):
     if not DASHBOARD_PASSWORD:
         return JSONResponse({"status": "ok", "message": "Auth disabled"})
 
+    client_ip = request.client.host if request.client else "unknown"
+    _check_brute_force(client_ip)
+
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     password = body.get("password", "")
-    if password != DASHBOARD_PASSWORD:
+    if not secrets.compare_digest(password, DASHBOARD_PASSWORD):
+        _record_failed_login(client_ip)
         raise HTTPException(status_code=401, detail="Invalid password")
 
     token = create_session()
@@ -586,7 +643,7 @@ async def handle_text_webhook(request: Request, background_tasks: BackgroundTask
     if WEBHOOK_SECRET:
         header_secret = request.headers.get("X-Webhook-Secret", "")
         query_secret = request.query_params.get("secret", "")
-        if header_secret != WEBHOOK_SECRET and query_secret != WEBHOOK_SECRET:
+        if not (secrets.compare_digest(header_secret, WEBHOOK_SECRET) or secrets.compare_digest(query_secret, WEBHOOK_SECRET)):
             logger.warning("Text webhook rejected: invalid secret")
             raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
@@ -678,7 +735,7 @@ async def handle_unified_webhook(request: Request, background_tasks: BackgroundT
     if WEBHOOK_SECRET:
         header_secret = request.headers.get("X-Webhook-Secret", "")
         query_secret = request.query_params.get("secret", "")
-        if header_secret != WEBHOOK_SECRET and query_secret != WEBHOOK_SECRET:
+        if not (secrets.compare_digest(header_secret, WEBHOOK_SECRET) or secrets.compare_digest(query_secret, WEBHOOK_SECRET)):
             logger.warning("Unified webhook rejected: invalid secret")
             raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
@@ -1600,13 +1657,17 @@ async def greetings_login(request: Request):
     if not GREETINGS_PASSWORD:
         return JSONResponse({"status": "ok", "message": "Auth disabled"})
 
+    client_ip = request.client.host if request.client else "unknown"
+    _check_brute_force(client_ip)
+
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     password = body.get("password", "")
-    if password != GREETINGS_PASSWORD:
+    if not secrets.compare_digest(password, GREETINGS_PASSWORD):
+        _record_failed_login(client_ip)
         raise HTTPException(status_code=401, detail="Invalid password")
 
     token = create_greetings_session()
@@ -1673,8 +1734,11 @@ async def greetings_upload(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Only .xlsx files are accepted")
 
     content = await file.read()
+    # Security: limit file size to 10 MB
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
     try:
-        wb = load_workbook(io.BytesIO(content), read_only=True)
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         ws = wb.active
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot read Excel file: {e}")
@@ -1834,7 +1898,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logger.remove(0)
-    logger.add(sys.stderr, level="TRACE" if args.verbose else "DEBUG")
+    if args.verbose:
+        logger.add(sys.stderr, level="TRACE")
+    elif IS_PRODUCTION:
+        logger.add(sys.stderr, level="INFO")
+    else:
+        logger.add(sys.stderr, level="DEBUG")
 
     try:
         asyncio.run(run_server(args.host, args.port))

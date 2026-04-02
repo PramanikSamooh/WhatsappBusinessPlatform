@@ -20,14 +20,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser
+
 # Create directories for persistent data (mount as volumes in production)
-RUN mkdir -p recordings data static
+RUN mkdir -p recordings data static && chown -R appuser:appuser /app
 
 # Keep a pristine copy of knowledge/ so new files can be synced into the volume
 RUN cp -r knowledge knowledge.defaults
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+USER appuser
 
 EXPOSE 7860
 
