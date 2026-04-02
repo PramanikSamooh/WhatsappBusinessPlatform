@@ -348,16 +348,20 @@ async function loadCampaigns() {
             const total = c.recipient_count || 0;
             const sent = (c.sent_count || 0) + (c.delivered_count || 0) + (c.read_count || 0);
             const failed = c.failed_count || 0;
+            const canDelete = c.status !== 'running';
             return `
-                <div class="border border-gray-200 rounded-lg p-4 hover:bg-gray-50 cursor-pointer transition" onclick="showCampaignDetail('${c.id}')">
+                <div class="border border-gray-200 rounded-lg p-4 hover:bg-gray-50 transition">
                     <div class="flex items-center justify-between">
-                        <div>
+                        <div class="cursor-pointer flex-1" onclick="showCampaignDetail('${c.id}')">
                             <span class="font-medium text-gray-800">${esc(c.name)}</span>
                             <span class="badge badge-${c.status} ml-2">${c.status}</span>
                         </div>
-                        <span class="text-xs text-gray-400">${fmtDate(c.created_at)}</span>
+                        <div class="flex items-center gap-3">
+                            <span class="text-xs text-gray-400">${fmtDate(c.created_at)}</span>
+                            ${canDelete ? `<button onclick="event.stopPropagation(); deleteCampaign('${c.id}', '${esc(c.name)}')" class="text-xs text-red-400 hover:text-red-600" title="Delete">&#10005;</button>` : ''}
+                        </div>
                     </div>
-                    <div class="mt-2 text-xs text-gray-500">
+                    <div class="mt-2 text-xs text-gray-500 cursor-pointer" onclick="showCampaignDetail('${c.id}')">
                         ${total} recipients | ${sent} sent | ${failed} failed | Template: ${esc(c.template_name)}
                     </div>
                 </div>`;
@@ -422,6 +426,15 @@ async function refreshCampaignDetail(campaignId) {
             if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
         }
     } catch (e) { console.error('Refresh detail error:', e); }
+}
+
+async function deleteCampaign(campaignId, name) {
+    if (!confirm(`Delete campaign "${name}"?`)) return;
+    try {
+        await api(`/api/greetings/campaigns/${campaignId}/delete`, { method: 'DELETE' });
+        if (activeCampaignId === campaignId) closeCampaignDetail();
+        loadCampaigns();
+    } catch (e) { alert('Delete failed: ' + e.message); }
 }
 
 function closeCampaignDetail() {

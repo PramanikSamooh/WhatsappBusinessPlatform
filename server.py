@@ -373,31 +373,6 @@ async def lifespan(app: FastAPI):
     knowledge_context = load_knowledge()
     logger.info(f"Knowledge loaded: {len(knowledge_context)} characters")
 
-    # Start background cleanup task for old campaigns (>7 days)
-    async def _cleanup_old_campaigns():
-        """Delete campaigns older than 7 days, runs every 6 hours."""
-        while not shutdown_event.is_set():
-            try:
-                await asyncio.sleep(6 * 3600)  # every 6 hours
-                cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                old = await list_campaigns(limit=1000)
-                deleted = 0
-                for c in old:
-                    if c.get("created_at", "") < cutoff and c["status"] not in ("running",):
-                        try:
-                            await delete_campaign(c["id"])
-                            deleted += 1
-                        except Exception:
-                            pass
-                if deleted:
-                    logger.info(f"Auto-cleanup: deleted {deleted} campaigns older than 7 days")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Campaign cleanup error: {e}")
-
-    cleanup_task = asyncio.create_task(_cleanup_old_campaigns())
-
     async with aiohttp.ClientSession() as session:
         whatsapp_client = WhatsAppClient(
             whatsapp_token=WHATSAPP_TOKEN,
@@ -408,7 +383,6 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
-            cleanup_task.cancel()
             if whatsapp_client:
                 await whatsapp_client.terminate_all_calls()
             await close_wa_session()
