@@ -1921,7 +1921,7 @@ async def greetings_drive_folder(request: Request):
     try:
         from gdrive import list_folder_images, DRIVE_CONFIGURED
         if not DRIVE_CONFIGURED:
-            raise HTTPException(status_code=500, detail="Google Drive not configured. Set GOOGLE_SHEETS_CREDENTIALS_JSON env var.")
+            raise HTTPException(status_code=500, detail="Google Drive not configured. Set GOOGLE_API_KEY env var.")
         images = await list_folder_images(folder_id)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
