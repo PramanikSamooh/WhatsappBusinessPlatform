@@ -10,7 +10,7 @@ Address: [Full address]
 State: Jharkhand
 
 ## Contact
-Phone: +91 98293 93505
+Phone: +91 99340 50345 (Virendra Jain)
 <!-- TODO: Add more contact details -->
 Email: [Your email]
 Website: gunayatan.org
