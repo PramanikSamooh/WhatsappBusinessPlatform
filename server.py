@@ -83,11 +83,12 @@ from campaign_db import (
 )
 from campaign_runner import is_campaign_running, request_pause, run_campaign
 from db import complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
-from knowledge import KNOWLEDGE_DIR, load_knowledge
+from knowledge import KNOWLEDGE_DIR, invalidate_cache as invalidate_knowledge_cache, load_knowledge
 from message_router import is_global_ai_enabled, route_webhook, set_global_ai_enabled
 from orders import handle_razorpay_webhook
 from orders_db import get_order, get_order_stats, list_orders as list_orders_db
 from whatsapp_messaging import (
+    close_session as close_wa_session,
     get_whatsapp_templates,
     send_interactive_message,
     send_whatsapp_template,
@@ -350,6 +351,7 @@ async def lifespan(app: FastAPI):
         finally:
             if whatsapp_client:
                 await whatsapp_client.terminate_all_calls()
+            await close_wa_session()
             logger.info("Cleanup done")
 
 
@@ -1517,6 +1519,7 @@ async def update_knowledge_file(filename: str, request: Request):
     content = body.get("content", "")
     file_path = KNOWLEDGE_DIR / filename
     file_path.write_text(content, encoding="utf-8")
+    invalidate_knowledge_cache()
     logger.info(f"Knowledge file updated: {filename} ({len(content)} chars)")
     return {"status": "saved", "name": filename}
 
@@ -1537,6 +1540,7 @@ async def create_knowledge_file(request: Request):
         raise HTTPException(status_code=409, detail="File already exists")
 
     file_path.write_text(content, encoding="utf-8")
+    invalidate_knowledge_cache()
     logger.info(f"Knowledge file created: {filename}")
     return {"status": "created", "name": filename}
 
@@ -1549,6 +1553,7 @@ async def delete_knowledge_file(filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     file_path.unlink()
+    invalidate_knowledge_cache()
     logger.info(f"Knowledge file deleted: {filename}")
     return {"status": "deleted", "name": filename}
 
@@ -1572,6 +1577,7 @@ async def rename_knowledge_file(filename: str, request: Request):
         raise HTTPException(status_code=409, detail="Target filename already exists")
 
     old_path.rename(new_path)
+    invalidate_knowledge_cache()
     logger.info(f"Knowledge file renamed: {filename} -> {new_name}")
     return {"status": "renamed", "old_name": filename, "new_name": new_name}
 

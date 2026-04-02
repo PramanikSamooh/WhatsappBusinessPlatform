@@ -7,25 +7,16 @@ Google Sheet log, lead creation, handoff alerts, etc.
 
 import os
 
-import aiohttp
 from loguru import logger
+
+from whatsapp_messaging import _get_session
 
 N8N_CALL_HOOK_URL = os.getenv("N8N_CALL_HOOK_URL", "")
 N8N_CHAT_HOOK_URL = os.getenv("N8N_CHAT_HOOK_URL", "")
 
 
 async def send_call_summary(call_data: dict):
-    """Send enriched call data to n8n after a call ends.
-
-    Args:
-        call_data: Dict with full call info including:
-            - call_id, caller_phone, caller_name
-            - connected_at, disconnected_at, duration_seconds
-            - transcript (list of {role, content} dicts)
-            - handoff_requested (bool), handoff_reason (str)
-            - topics (list of strings)
-            - recording_path (str)
-    """
+    """Send enriched call data to n8n after a call ends."""
     if not N8N_CALL_HOOK_URL:
         logger.debug("N8N_CALL_HOOK_URL not set, skipping call summary hook")
         return
@@ -52,30 +43,19 @@ async def send_call_summary(call_data: dict):
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                N8N_CALL_HOOK_URL,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    logger.info(f"Call summary sent to n8n: call_id={call_data.get('call_id')}")
-                else:
-                    body = await resp.text()
-                    logger.warning(f"n8n hook returned {resp.status}: {body}")
+        session = await _get_session()
+        async with session.post(N8N_CALL_HOOK_URL, json=payload) as resp:
+            if resp.status == 200:
+                logger.info(f"Call summary sent to n8n: call_id={call_data.get('call_id')}")
+            else:
+                body = await resp.text()
+                logger.warning(f"n8n hook returned {resp.status}: {body}")
     except Exception as e:
         logger.error(f"Failed to send call summary to n8n: {e}")
 
 
 async def send_chat_summary(chat_data: dict):
-    """Send chat handoff notification to n8n.
-
-    Args:
-        chat_data: Dict with:
-            - conversation_id, phone, name
-            - handoff_requested (bool), handoff_reason (str)
-            - topics (list), message_count (int), last_message (str)
-    """
+    """Send chat handoff notification to n8n."""
     if not N8N_CHAT_HOOK_URL:
         logger.debug("N8N_CHAT_HOOK_URL not set, skipping chat summary hook")
         return
@@ -97,16 +77,12 @@ async def send_chat_summary(chat_data: dict):
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                N8N_CHAT_HOOK_URL,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    logger.info(f"Chat summary sent to n8n: conv={chat_data.get('conversation_id')}")
-                else:
-                    body = await resp.text()
-                    logger.warning(f"n8n chat hook returned {resp.status}: {body}")
+        session = await _get_session()
+        async with session.post(N8N_CHAT_HOOK_URL, json=payload) as resp:
+            if resp.status == 200:
+                logger.info(f"Chat summary sent to n8n: conv={chat_data.get('conversation_id')}")
+            else:
+                body = await resp.text()
+                logger.warning(f"n8n chat hook returned {resp.status}: {body}")
     except Exception as e:
         logger.error(f"Failed to send chat summary to n8n: {e}")

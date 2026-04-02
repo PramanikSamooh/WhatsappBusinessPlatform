@@ -18,8 +18,9 @@ conversation thread.
 import asyncio
 import os
 
-import aiohttp
 from loguru import logger
+
+from whatsapp_messaging import _get_session
 
 CHATWOOT_WEBHOOK_URL = os.getenv("CHATWOOT_WEBHOOK_URL", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
@@ -38,11 +39,10 @@ async def forward_incoming_to_chatwoot(body: dict) -> None:
         return
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        session = await _get_session()
+        async with session.post(
                 CHATWOOT_WEBHOOK_URL,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status in (200, 201):
                     logger.debug("Forwarded incoming message to Chatwoot")

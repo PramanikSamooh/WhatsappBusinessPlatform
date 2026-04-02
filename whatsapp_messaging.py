@@ -27,6 +27,35 @@ WHATSAPP_API_URL = (
     f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 )
 
+# Shared aiohttp session — reuses TCP connections instead of creating new ones per request.
+# At 50k msgs/day this prevents socket exhaustion and TCP handshake overhead.
+_shared_session: aiohttp.ClientSession | None = None
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    """Get or create the shared aiohttp session with connection pooling."""
+    global _shared_session
+    if _shared_session is None or _shared_session.closed:
+        connector = aiohttp.TCPConnector(
+            limit=100,          # max concurrent connections
+            limit_per_host=50,  # max to graph.facebook.com
+            ttl_dns_cache=300,  # cache DNS for 5 min
+            keepalive_timeout=30,
+        )
+        _shared_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
+    return _shared_session
+
+
+async def close_session():
+    """Close the shared session gracefully. Call on server shutdown."""
+    global _shared_session
+    if _shared_session and not _shared_session.closed:
+        await _shared_session.close()
+        _shared_session = None
+
 
 async def send_whatsapp_text(to_phone: str, message: str) -> bool:
     """Send a text message via WhatsApp Cloud API.
@@ -58,12 +87,11 @@ async def send_whatsapp_text(to_phone: str, message: str) -> bool:
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        session = await _get_session()
+        async with session.post(
                 WHATSAPP_API_URL,
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     logger.info(f"WhatsApp text sent to {to_phone}")
@@ -101,12 +129,11 @@ async def mark_message_as_read(message_id: str) -> bool:
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        session = await _get_session()
+        async with session.post(
                 WHATSAPP_API_URL,
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     logger.debug(f"Read receipt sent for {message_id}")
@@ -139,12 +166,11 @@ async def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str, str
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
 
     try:
-        async with aiohttp.ClientSession() as session:
-            # Step 1: Get media URL
-            meta_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}"
-            async with session.get(
+        session = await _get_session()
+        # Step 1: Get media URL
+        meta_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}"
+        async with session.get(
                 meta_url, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -159,22 +185,21 @@ async def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str, str
                 logger.warning(f"No URL in media metadata for {media_id}")
                 return None, "", ""
 
-            # Step 2: Download binary
-            async with session.get(
+        # Step 2: Download binary
+        async with session.get(
                 media_url, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Media download failed ({resp.status}) for {media_id}")
-                    return None, "", ""
-                data = await resp.read()
+            if resp.status != 200:
+                logger.warning(f"Media download failed ({resp.status}) for {media_id}")
+                return None, "", ""
+            data = await resp.read()
 
-            # Derive filename from media_id + extension
-            ext = _mime_to_extension(mime_type)
-            filename = f"{media_id}{ext}"
+        # Derive filename from media_id + extension
+        ext = _mime_to_extension(mime_type)
+        filename = f"{media_id}{ext}"
 
-            logger.info(f"Downloaded media {media_id}: {len(data)} bytes, {mime_type}")
-            return data, mime_type, filename
+        logger.info(f"Downloaded media {media_id}: {len(data)} bytes, {mime_type}")
+        return data, mime_type, filename
 
     except Exception as e:
         logger.error(f"Failed to download media {media_id}: {e}")
@@ -250,12 +275,11 @@ async def send_whatsapp_template(
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        session = await _get_session()
+        async with session.post(
                 WHATSAPP_API_URL,
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -288,22 +312,22 @@ async def _resolve_waba_id() -> str:
     # Resolve from phone number ID
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
     try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}?fields=whatsapp_business_account"
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    waba_id = data.get("whatsapp_business_account", {}).get("id", "")
-                    if waba_id:
-                        logger.info(f"Resolved WABA ID: {waba_id}")
-                        return waba_id
-                    else:
-                        logger.warning("WABA ID not found in phone number response. "
-                                       "Set WHATSAPP_BUSINESS_ACCOUNT_ID env var manually.")
+        session = await _get_session()
+        url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}?fields=whatsapp_business_account"
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                waba_id = data.get("whatsapp_business_account", {}).get("id", "")
+                if waba_id:
+                    logger.info(f"Resolved WABA ID: {waba_id}")
+                    return waba_id
                 else:
-                    body = await resp.text()
-                    logger.warning(f"WABA ID lookup failed ({resp.status}): {body[:200]}. "
+                    logger.warning("WABA ID not found in phone number response. "
                                    "Set WHATSAPP_BUSINESS_ACCOUNT_ID env var manually.")
+            else:
+                body = await resp.text()
+                logger.warning(f"WABA ID lookup failed ({resp.status}): {body[:200]}. "
+                               "Set WHATSAPP_BUSINESS_ACCOUNT_ID env var manually.")
     except Exception as e:
         logger.warning(f"Failed to resolve WABA ID: {e}. "
                        "Set WHATSAPP_BUSINESS_ACCOUNT_ID env var manually.")
@@ -336,21 +360,20 @@ async def get_whatsapp_templates() -> list[dict]:
     url = f"{base_url}?limit=100&fields=name,status,language,category,components"
 
     try:
-        async with aiohttp.ClientSession() as session:
-            while url:
-                async with session.get(
-                    url,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning(f"Template fetch failed {resp.status}: {body}")
-                        break
-                    data = await resp.json()
-                    all_templates.extend(data.get("data", []))
-                    # Follow pagination cursor
-                    url = data.get("paging", {}).get("next", "")
+        session = await _get_session()
+        while url:
+            async with session.get(
+                url,
+                headers=headers,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"Template fetch failed {resp.status}: {body}")
+                    break
+                data = await resp.json()
+                all_templates.extend(data.get("data", []))
+                # Follow pagination cursor
+                url = data.get("paging", {}).get("next", "")
     except Exception as e:
         logger.error(f"Failed to fetch templates: {e}")
         return all_templates
@@ -422,12 +445,11 @@ async def send_interactive_message(
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        session = await _get_session()
+        async with session.post(
                 WHATSAPP_API_URL,
                 json=payload,
                 headers=hdrs,
-                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
