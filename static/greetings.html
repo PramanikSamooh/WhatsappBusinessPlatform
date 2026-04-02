@@ -37,7 +37,6 @@
 
     <!-- Main App -->
     <div id="appScreen" class="hidden">
-        <!-- Header -->
         <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
             <div>
                 <h1 class="text-lg font-bold text-gray-800">Shubhkamnaye</h1>
@@ -55,6 +54,21 @@
                 </p>
                 <div id="uploadError" class="hidden bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm"></div>
                 <div id="uploadSuccess" class="hidden bg-green-50 text-green-700 p-3 rounded-lg mb-4 text-sm"></div>
+
+                <!-- Confirmation box (shown after upload, before sending) -->
+                <div id="confirmBox" class="hidden bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+                    <p class="text-sm font-medium text-blue-800 mb-2" id="confirmText"></p>
+                    <div class="flex gap-3">
+                        <button onclick="doStartCampaign()" id="confirmSendBtn"
+                            class="bg-green-600 text-white rounded-lg px-5 py-2 text-sm font-medium hover:bg-green-700 transition">
+                            Send Now
+                        </button>
+                        <button onclick="cancelCampaign()"
+                            class="bg-gray-200 text-gray-700 rounded-lg px-5 py-2 text-sm font-medium hover:bg-gray-300 transition">
+                            Cancel
+                        </button>
+                    </div>
+                </div>
 
                 <form id="uploadForm" onsubmit="doUpload(event)" class="space-y-4">
                     <div>
@@ -83,7 +97,7 @@
                     </div>
                     <button type="submit" id="uploadBtn"
                         class="bg-blue-600 text-white rounded-lg px-6 py-2.5 font-medium hover:bg-blue-700 transition text-sm">
-                        Upload & Send
+                        Upload
                     </button>
                 </form>
             </div>
@@ -99,15 +113,13 @@
                 </div>
             </div>
 
-            <!-- Campaign Detail (shown when a campaign is selected) -->
+            <!-- Campaign Detail -->
             <div id="campaignDetail" class="hidden bg-white rounded-xl shadow-sm border border-gray-200 p-6">
                 <div class="flex items-center justify-between mb-4">
                     <h2 class="text-lg font-semibold" id="detailTitle">Campaign Detail</h2>
                     <button onclick="closeCampaignDetail()" class="text-sm text-gray-500 hover:text-gray-700">Close</button>
                 </div>
-                <!-- Stats -->
                 <div id="detailStats" class="grid grid-cols-5 gap-3 mb-4"></div>
-                <!-- Recipients Table -->
                 <div class="overflow-x-auto">
                     <table class="w-full text-sm">
                         <thead>
@@ -116,6 +128,7 @@
                                 <th class="py-2 px-2">Phone</th>
                                 <th class="py-2 px-2">Status</th>
                                 <th class="py-2 px-2">Sent At</th>
+                                <th class="py-2 px-2">Error</th>
                             </tr>
                         </thead>
                         <tbody id="detailRecipients"></tbody>
@@ -129,20 +142,59 @@
 let csrfToken = '';
 let refreshInterval = null;
 let activeCampaignId = null;
+let pendingCampaignId = null;
 
 function getCookie(name) {
     const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
     return m ? m[2] : '';
 }
 
+function fmtDate(dateStr) {
+    if (!dateStr) return '-';
+    // Handle SQLite dates (no Z suffix) and ISO dates
+    let d;
+    if (dateStr.includes('T')) {
+        d = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z');
+    } else {
+        d = new Date(dateStr + 'Z');
+    }
+    if (isNaN(d.getTime())) return '-';
+    return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtTime(dateStr) {
+    if (!dateStr) return '-';
+    let d;
+    if (dateStr.includes('T')) {
+        d = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z');
+    } else {
+        d = new Date(dateStr + 'Z');
+    }
+    if (isNaN(d.getTime())) return '-';
+    return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+}
+
+function shortError(err) {
+    if (!err) return '';
+    // Extract short error description from Meta error format
+    // [131049] This message was not delivered... → "Ecosystem limit"
+    // [131026] Message undeliverable... → "Not on WhatsApp"
+    // [131047] Re-engagement required... → "Re-engagement needed"
+    if (err.includes('131049')) return 'Ecosystem limit';
+    if (err.includes('131026')) return 'Not on WhatsApp';
+    if (err.includes('131047')) return 'Re-engagement needed';
+    if (err.includes('131053')) return 'Media error';
+    if (err.includes('130472')) return 'Template paused';
+    if (err.includes('132000')) return 'Param mismatch';
+    // Fallback: first 40 chars
+    return err.length > 40 ? err.substring(0, 40) + '...' : err;
+}
+
 async function api(url, opts = {}) {
     const headers = opts.headers || {};
     if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
     const resp = await fetch(url, { ...opts, headers, credentials: 'include' });
-    if (resp.status === 401) {
-        showLogin();
-        throw new Error('Unauthorized');
-    }
+    if (resp.status === 401) { showLogin(); throw new Error('Unauthorized'); }
     return resp;
 }
 
@@ -162,12 +214,8 @@ async function checkAuth() {
     try {
         const resp = await fetch('/auth/greetings-check', { credentials: 'include' });
         const data = await resp.json();
-        if (data.authenticated) {
-            csrfToken = getCookie('greetings_csrf');
-            showApp();
-        } else {
-            showLogin();
-        }
+        if (data.authenticated) { csrfToken = getCookie('greetings_csrf'); showApp(); }
+        else showLogin();
     } catch { showLogin(); }
 }
 
@@ -177,23 +225,18 @@ async function doLogin() {
     errEl.classList.add('hidden');
     try {
         const resp = await fetch('/auth/greetings-login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password: pw }),
-            credentials: 'include',
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: pw }), credentials: 'include',
         });
         if (resp.ok) {
             const data = await resp.json();
             csrfToken = getCookie('greetings_csrf') || data.csrf_token;
             showApp();
         } else {
-            errEl.textContent = 'Invalid password';
+            errEl.textContent = resp.status === 429 ? 'Too many attempts. Wait 10 minutes.' : 'Invalid password';
             errEl.classList.remove('hidden');
         }
-    } catch (e) {
-        errEl.textContent = 'Login failed: ' + e.message;
-        errEl.classList.remove('hidden');
-    }
+    } catch (e) { errEl.textContent = 'Login failed: ' + e.message; errEl.classList.remove('hidden'); }
 }
 
 async function doLogout() {
@@ -206,8 +249,10 @@ async function doUpload(event) {
     const btn = document.getElementById('uploadBtn');
     const errEl = document.getElementById('uploadError');
     const successEl = document.getElementById('uploadSuccess');
+    const confirmBox = document.getElementById('confirmBox');
     errEl.classList.add('hidden');
     successEl.classList.add('hidden');
+    confirmBox.classList.add('hidden');
 
     const fileInput = document.getElementById('fileInput');
     if (!fileInput.files.length) return;
@@ -222,27 +267,19 @@ async function doUpload(event) {
     formData.append('campaign_name', document.getElementById('campaignName').value);
 
     try {
-        const resp = await api('/api/greetings/upload', {
-            method: 'POST',
-            body: formData,
-        });
+        const resp = await api('/api/greetings/upload', { method: 'POST', body: formData });
         let data;
-        const contentType = resp.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-            data = await resp.json();
-        } else {
-            const text = await resp.text();
-            data = { detail: text || `Server error (${resp.status})` };
-        }
+        const ct = resp.headers.get('content-type') || '';
+        if (ct.includes('application/json')) { data = await resp.json(); }
+        else { const text = await resp.text(); data = { detail: text || `Server error (${resp.status})` }; }
+
         if (resp.ok) {
-            successEl.textContent = `Campaign started! ${data.recipients?.added || 0} recipients added.`;
-            successEl.classList.remove('hidden');
-            fileInput.value = '';
-            document.getElementById('campaignName').value = '';
+            pendingCampaignId = data.campaign_id;
+            const count = data.recipients?.added || 0;
+            document.getElementById('confirmText').textContent =
+                `${count} recipients loaded. Template: ${data.template || 'shubhkamnaye'}. Ready to send?`;
+            confirmBox.classList.remove('hidden');
             loadCampaigns();
-            if (data.campaign_id) {
-                showCampaignDetail(data.campaign_id);
-            }
         } else {
             errEl.textContent = data.detail || `Upload failed (${resp.status})`;
             errEl.classList.remove('hidden');
@@ -252,8 +289,48 @@ async function doUpload(event) {
         errEl.classList.remove('hidden');
     } finally {
         btn.disabled = false;
-        btn.textContent = 'Upload & Send';
+        btn.textContent = 'Upload';
     }
+}
+
+async function doStartCampaign() {
+    if (!pendingCampaignId) return;
+    const btn = document.getElementById('confirmSendBtn');
+    btn.disabled = true;
+    btn.textContent = 'Starting...';
+
+    try {
+        const resp = await api(`/api/greetings/campaigns/${pendingCampaignId}/start`, { method: 'POST' });
+        if (resp.ok) {
+            document.getElementById('confirmBox').classList.add('hidden');
+            document.getElementById('uploadSuccess').textContent = 'Campaign started! Messages are being sent.';
+            document.getElementById('uploadSuccess').classList.remove('hidden');
+            document.getElementById('fileInput').value = '';
+            document.getElementById('campaignName').value = '';
+            loadCampaigns();
+            showCampaignDetail(pendingCampaignId);
+            pendingCampaignId = null;
+        } else {
+            const data = await resp.json().catch(() => ({}));
+            document.getElementById('uploadError').textContent = data.detail || 'Failed to start campaign';
+            document.getElementById('uploadError').classList.remove('hidden');
+        }
+    } catch (e) {
+        document.getElementById('uploadError').textContent = 'Start error: ' + e.message;
+        document.getElementById('uploadError').classList.remove('hidden');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Send Now';
+    }
+}
+
+async function cancelCampaign() {
+    if (pendingCampaignId) {
+        try { await api(`/api/greetings/campaigns/${pendingCampaignId}/delete`, { method: 'DELETE' }); } catch {}
+        pendingCampaignId = null;
+    }
+    document.getElementById('confirmBox').classList.add('hidden');
+    loadCampaigns();
 }
 
 async function loadCampaigns() {
@@ -271,7 +348,6 @@ async function loadCampaigns() {
             const total = c.recipient_count || 0;
             const sent = (c.sent_count || 0) + (c.delivered_count || 0) + (c.read_count || 0);
             const failed = c.failed_count || 0;
-            const date = c.created_at ? new Date(c.created_at + 'Z').toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '';
             return `
                 <div class="border border-gray-200 rounded-lg p-4 hover:bg-gray-50 cursor-pointer transition" onclick="showCampaignDetail('${c.id}')">
                     <div class="flex items-center justify-between">
@@ -279,26 +355,21 @@ async function loadCampaigns() {
                             <span class="font-medium text-gray-800">${esc(c.name)}</span>
                             <span class="badge badge-${c.status} ml-2">${c.status}</span>
                         </div>
-                        <span class="text-xs text-gray-400">${date}</span>
+                        <span class="text-xs text-gray-400">${fmtDate(c.created_at)}</span>
                     </div>
                     <div class="mt-2 text-xs text-gray-500">
                         ${total} recipients | ${sent} sent | ${failed} failed | Template: ${esc(c.template_name)}
                     </div>
                 </div>`;
         }).join('');
-    } catch (e) {
-        console.error('Load campaigns error:', e);
-    }
+    } catch (e) { console.error('Load campaigns error:', e); }
 }
 
 async function showCampaignDetail(campaignId) {
     activeCampaignId = campaignId;
     document.getElementById('campaignDetail').classList.remove('hidden');
-
-    // Start auto-refresh
     if (refreshInterval) clearInterval(refreshInterval);
     refreshInterval = setInterval(() => refreshCampaignDetail(campaignId), 5000);
-
     await refreshCampaignDetail(campaignId);
 }
 
@@ -334,23 +405,23 @@ async function refreshCampaignDetail(campaignId) {
 
         const recipients = c.recipients || [];
         document.getElementById('detailRecipients').innerHTML = recipients.map(r => {
-            const sentAt = r.sent_at ? new Date(r.sent_at + 'Z').toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }) : '-';
+            const errHtml = r.error_message
+                ? `<span class="text-red-500 text-xs" title="${esc(r.error_message)}">${esc(shortError(r.error_message))}</span>`
+                : '';
             return `
                 <tr class="border-b border-gray-100">
                     <td class="py-2 px-2">${esc(r.name || '-')}</td>
                     <td class="py-2 px-2 font-mono text-xs">${esc(r.phone)}</td>
                     <td class="py-2 px-2"><span class="badge badge-${r.status}">${r.status}</span></td>
-                    <td class="py-2 px-2 text-xs text-gray-500">${sentAt}</td>
+                    <td class="py-2 px-2 text-xs text-gray-500">${fmtTime(r.sent_at)}</td>
+                    <td class="py-2 px-2">${errHtml}</td>
                 </tr>`;
         }).join('');
 
-        // Stop refreshing when campaign is done
         if (c.status === 'completed' || c.status === 'failed') {
             if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
         }
-    } catch (e) {
-        console.error('Refresh detail error:', e);
-    }
+    } catch (e) { console.error('Refresh detail error:', e); }
 }
 
 function closeCampaignDetail() {
@@ -359,13 +430,8 @@ function closeCampaignDetail() {
     if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
 }
 
-function esc(str) {
-    const d = document.createElement('div');
-    d.textContent = str || '';
-    return d.innerHTML;
-}
+function esc(str) { const d = document.createElement('div'); d.textContent = str || ''; return d.innerHTML; }
 
-// Init
 checkAuth();
 </script>
 </body>

@@ -373,6 +373,31 @@ async def lifespan(app: FastAPI):
     knowledge_context = load_knowledge()
     logger.info(f"Knowledge loaded: {len(knowledge_context)} characters")
 
+    # Start background cleanup task for old campaigns (>7 days)
+    async def _cleanup_old_campaigns():
+        """Delete campaigns older than 7 days, runs every 6 hours."""
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.sleep(6 * 3600)  # every 6 hours
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                old = await list_campaigns(limit=1000)
+                deleted = 0
+                for c in old:
+                    if c.get("created_at", "") < cutoff and c["status"] not in ("running",):
+                        try:
+                            await delete_campaign(c["id"])
+                            deleted += 1
+                        except Exception:
+                            pass
+                if deleted:
+                    logger.info(f"Auto-cleanup: deleted {deleted} campaigns older than 7 days")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Campaign cleanup error: {e}")
+
+    cleanup_task = asyncio.create_task(_cleanup_old_campaigns())
+
     async with aiohttp.ClientSession() as session:
         whatsapp_client = WhatsAppClient(
             whatsapp_token=WHATSAPP_TOKEN,
@@ -383,6 +408,7 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
+            cleanup_task.cancel()
             if whatsapp_client:
                 await whatsapp_client.terminate_all_calls()
             await close_wa_session()
@@ -1854,11 +1880,9 @@ async def greetings_upload(request: Request, background_tasks: BackgroundTasks):
     # Add recipients
     result = await add_recipients(campaign_id, records)
 
-    # Auto-start campaign
-    background_tasks.add_task(run_campaign, campaign_id)
-
+    # Don't auto-start — return draft campaign for user confirmation
     return {
-        "status": "started",
+        "status": "draft",
         "campaign_id": campaign_id,
         "campaign_name": campaign_name,
         "recipients": result,
@@ -1884,6 +1908,36 @@ async def greetings_campaign_status(campaign_id: str):
     campaign["recipient_stats"] = await get_recipient_stats(campaign_id)
     campaign["recipients"] = await list_recipients(campaign_id, limit=1000)
     return campaign
+
+
+@app.post("/api/greetings/campaigns/{campaign_id}/start", dependencies=[Depends(require_greetings_auth_csrf)])
+async def greetings_start_campaign(campaign_id: str, background_tasks: BackgroundTasks):
+    """Start a greeting campaign after user confirmation."""
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign["status"] not in ("draft", "paused"):
+        raise HTTPException(status_code=400, detail=f"Cannot start campaign with status '{campaign['status']}'")
+    if is_campaign_running(campaign_id):
+        raise HTTPException(status_code=400, detail="Campaign is already running")
+    stats = await get_recipient_stats(campaign_id)
+    if stats["total"] == 0:
+        raise HTTPException(status_code=400, detail="No recipients in campaign")
+
+    background_tasks.add_task(run_campaign, campaign_id)
+    return {"status": "starting", "campaign_id": campaign_id}
+
+
+@app.delete("/api/greetings/campaigns/{campaign_id}/delete", dependencies=[Depends(require_greetings_auth_csrf)])
+async def greetings_delete_campaign(campaign_id: str):
+    """Delete a greeting campaign (only draft/completed/failed)."""
+    try:
+        deleted = await delete_campaign(campaign_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"status": "deleted", "campaign_id": campaign_id}
 
 
 # --- Dashboard ---
