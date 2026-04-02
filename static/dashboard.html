@@ -530,6 +530,13 @@
                             <input id="campaign-rate" type="number" value="60" min="1" max="200"
                                 class="w-full border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500">
                         </div>
+                        <!-- Header Image URL (shown only for templates with IMAGE header) -->
+                        <div id="campaign-header-image-section" class="hidden">
+                            <label class="block text-xs font-medium text-gray-500 mb-1">Header Image URL</label>
+                            <input id="campaign-header-image" type="url" placeholder="https://example.com/image.jpg"
+                                class="w-full border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500">
+                            <p class="text-xs text-gray-400 mt-1">Public URL of the image to show in the message header</p>
+                        </div>
                         <!-- Template Variables -->
                         <div id="campaign-vars-section" class="hidden">
                             <label class="block text-xs font-medium text-gray-500 mb-1">Template Variables</label>
@@ -2056,6 +2063,8 @@
         document.getElementById('campaign-rate').value = '60';
         document.getElementById('campaign-vars-section').classList.add('hidden');
         document.getElementById('campaign-vars-list').innerHTML = '';
+        document.getElementById('campaign-header-image-section').classList.add('hidden');
+        document.getElementById('campaign-header-image').value = '';
         document.getElementById('campaign-template-preview').innerHTML = '<p class="text-xs text-gray-400 text-center mt-8">Select a template to preview</p>';
         document.getElementById('campaign-modal').classList.remove('hidden');
         loadTemplateDropdown();
@@ -2097,10 +2106,12 @@
         const previewEl = document.getElementById('campaign-template-preview');
         const varsSection = document.getElementById('campaign-vars-section');
         const varsList = document.getElementById('campaign-vars-list');
+        const headerImageSection = document.getElementById('campaign-header-image-section');
 
         if (!templateName) {
             previewEl.innerHTML = '<p class="text-xs text-gray-400 text-center mt-8">Select a template to preview</p>';
             varsSection.classList.add('hidden');
+            headerImageSection.classList.add('hidden');
             return;
         }
 
@@ -2113,6 +2124,20 @@
 
         // Render preview
         previewEl.innerHTML = renderTemplatePreview(tpl);
+
+        // Check if template has IMAGE/VIDEO/DOCUMENT header — show URL input
+        const components = tpl.components || [];
+        const headerComp = components.find(c => c.type === 'HEADER' && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(c.format));
+        if (headerComp) {
+            headerImageSection.classList.remove('hidden');
+            document.getElementById('campaign-header-image').placeholder =
+                headerComp.format === 'IMAGE' ? 'https://example.com/image.jpg' :
+                headerComp.format === 'VIDEO' ? 'https://example.com/video.mp4' :
+                'https://example.com/document.pdf';
+        } else {
+            headerImageSection.classList.add('hidden');
+            document.getElementById('campaign-header-image').value = '';
+        }
 
         // Extract variables and show editor
         const vars = extractTemplateVariables(tpl);
@@ -2217,6 +2242,9 @@
             templateParams.push(input.value || '');
         });
 
+        // Get header image URL if visible
+        const headerImageUrl = document.getElementById('campaign-header-image')?.value?.trim() || '';
+
         try {
             const res = await authFetch('/api/campaigns', {
                 method: 'POST',
@@ -2227,6 +2255,7 @@
                     template_category: category,
                     language,
                     template_params: templateParams.length ? templateParams : undefined,
+                    header_image_url: headerImageUrl || undefined,
                     rate_limit_per_min: parseInt(document.getElementById('campaign-rate').value) || 60,
                 }),
             });
