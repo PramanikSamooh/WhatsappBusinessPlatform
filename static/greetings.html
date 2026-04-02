@@ -93,6 +93,27 @@
                                     <tbody id="driveImagesBody"></tbody>
                                 </table>
                             </div>
+                            <!-- Bulk paste area -->
+                            <div class="mt-4 bg-gray-50 border border-gray-200 rounded-lg p-4">
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Bulk Paste Phone Numbers</label>
+                                <p class="text-xs text-gray-400 mb-2">Copy a column of phone numbers from Excel and paste below. One number per line — they will fill in order matching the images above.</p>
+                                <div class="flex gap-3">
+                                    <textarea id="bulkPhones" rows="4" placeholder="919413966420&#10;919829393505&#10;918000502743&#10;..."
+                                        class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:ring-1 focus:ring-blue-500 outline-none"></textarea>
+                                    <div class="flex flex-col gap-2">
+                                        <button type="button" onclick="applyBulkPhones()"
+                                            class="bg-blue-600 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-blue-700 transition whitespace-nowrap">
+                                            Apply
+                                        </button>
+                                        <button type="button" onclick="clearBulkPhones()"
+                                            class="bg-gray-200 text-gray-700 rounded-lg px-4 py-2 text-sm hover:bg-gray-300 transition whitespace-nowrap">
+                                            Clear All
+                                        </button>
+                                    </div>
+                                </div>
+                                <p id="bulkStatus" class="text-xs text-gray-500 mt-2 hidden"></p>
+                            </div>
+
                             <div class="mt-4 grid grid-cols-2 gap-4">
                                 <div>
                                     <label class="block text-xs font-medium text-gray-500 mb-1">Template Name</label>
@@ -327,6 +348,31 @@ async function loadDriveFolder() {
     } finally {
         btn.disabled = false; btn.textContent = 'Load Images';
     }
+}
+
+function applyBulkPhones() {
+    const text = document.getElementById('bulkPhones').value.trim();
+    if (!text) return;
+    // Split by newline, tab, or comma — handles Excel paste (newlines) and CSV
+    const phones = text.split(/[\n\r\t,]+/).map(p => p.trim()).filter(Boolean);
+    const inputs = document.querySelectorAll('.drive-phone');
+    let filled = 0;
+    phones.forEach((phone, i) => {
+        if (i < inputs.length) {
+            inputs[i].value = phone;
+            filled++;
+        }
+    });
+    const status = document.getElementById('bulkStatus');
+    status.textContent = `${filled} phone numbers applied` + (phones.length > inputs.length ? ` (${phones.length - inputs.length} extra numbers ignored — more numbers than images)` : '');
+    status.classList.remove('hidden');
+}
+
+function clearBulkPhones() {
+    document.getElementById('bulkPhones').value = '';
+    document.querySelectorAll('.drive-phone').forEach(input => { input.value = ''; });
+    document.querySelectorAll('.drive-name').forEach(input => { input.value = ''; });
+    document.getElementById('bulkStatus').classList.add('hidden');
 }
 
 function clearDriveImages() {
