@@ -226,19 +226,25 @@ async function doUpload(event) {
             method: 'POST',
             body: formData,
         });
-        const data = await resp.json();
+        let data;
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            data = await resp.json();
+        } else {
+            const text = await resp.text();
+            data = { detail: text || `Server error (${resp.status})` };
+        }
         if (resp.ok) {
             successEl.textContent = `Campaign started! ${data.recipients?.added || 0} recipients added.`;
             successEl.classList.remove('hidden');
             fileInput.value = '';
             document.getElementById('campaignName').value = '';
             loadCampaigns();
-            // Auto-open the new campaign detail
             if (data.campaign_id) {
                 showCampaignDetail(data.campaign_id);
             }
         } else {
-            errEl.textContent = data.detail || 'Upload failed';
+            errEl.textContent = data.detail || `Upload failed (${resp.status})`;
             errEl.classList.remove('hidden');
         }
     } catch (e) {
