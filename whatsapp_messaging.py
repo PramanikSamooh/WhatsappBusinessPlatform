@@ -169,26 +169,22 @@ async def download_whatsapp_media(media_id: str) -> tuple[bytes | None, str, str
         session = await _get_session()
         # Step 1: Get media URL
         meta_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{media_id}"
-        async with session.get(
-                meta_url, headers=headers,
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(f"Media URL fetch failed ({resp.status}): {body[:200]}")
-                    return None, "", ""
-                meta = await resp.json()
-
-            media_url = meta.get("url", "")
-            mime_type = meta.get("mime_type", "application/octet-stream")
-
-            if not media_url:
-                logger.warning(f"No URL in media metadata for {media_id}")
+        async with session.get(meta_url, headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"Media URL fetch failed ({resp.status}): {body[:200]}")
                 return None, "", ""
+            meta = await resp.json()
+
+        media_url = meta.get("url", "")
+        mime_type = meta.get("mime_type", "application/octet-stream")
+
+        if not media_url:
+            logger.warning(f"No URL in media metadata for {media_id}")
+            return None, "", ""
 
         # Step 2: Download binary
-        async with session.get(
-                media_url, headers=headers,
-            ) as resp:
+        async with session.get(media_url, headers=headers) as resp:
             if resp.status != 200:
                 logger.warning(f"Media download failed ({resp.status}) for {media_id}")
                 return None, "", ""
