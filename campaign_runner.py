@@ -55,6 +55,7 @@ async def run_campaign(campaign_id: str) -> None:
     template_name = campaign["template_name"]
     language = campaign.get("language", "en")
     template_params = campaign.get("template_params") or []
+    campaign_header_image = campaign.get("header_image_url", "")
 
     # Mark as running
     _running_campaigns[campaign_id] = False
@@ -104,6 +105,10 @@ async def run_campaign(campaign_id: str) -> None:
                         extra_data = _json.loads(recipient["extra_data"])
                     except (ValueError, TypeError):
                         pass
+
+                # Use campaign-level header image as fallback if recipient doesn't have one
+                if not extra_data.get("image_url") and campaign_header_image:
+                    extra_data["image_url"] = campaign_header_image
 
                 # Build template components with recipient-specific params
                 components = _build_components(template_params, name, extra_data)

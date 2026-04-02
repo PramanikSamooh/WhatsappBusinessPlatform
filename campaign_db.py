@@ -53,6 +53,12 @@ async def init_campaign_tables():
             await db.commit()
         except Exception:
             pass  # Column already exists
+        # Migration: add header_image_url for campaigns with image header templates
+        try:
+            await db.execute("ALTER TABLE campaigns ADD COLUMN header_image_url TEXT DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
         await db.execute("""
             CREATE TABLE IF NOT EXISTS campaign_recipients (
                 id              TEXT PRIMARY KEY,
@@ -103,6 +109,7 @@ async def create_campaign(
     template_params: list | None = None,
     rate_limit_per_min: int = 60,
     source: str = "",
+    header_image_url: str = "",
 ) -> dict:
     """Create a new campaign in draft status."""
     campaign_id = generate_id()
@@ -112,8 +119,8 @@ async def create_campaign(
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO campaigns (id, name, template_name, template_category, language, template_params,
-               rate_limit_per_min, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (campaign_id, name, template_name, template_category, language, params_json, rate_limit_per_min, source, now),
+               rate_limit_per_min, source, header_image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (campaign_id, name, template_name, template_category, language, params_json, rate_limit_per_min, source, header_image_url, now),
         )
         await db.commit()
 
@@ -157,6 +164,7 @@ _CAMPAIGN_ALLOWED_COLUMNS = {
     "name", "template_name", "template_category", "language", "template_params", "status",
     "recipient_count", "sent_count", "delivered_count", "read_count",
     "failed_count", "rate_limit_per_min", "started_at", "completed_at", "source",
+    "header_image_url",
 }
 
 

@@ -1041,6 +1041,7 @@ async def api_create_campaign(request: Request):
         template_category=body.get("template_category", ""),
         template_params=body.get("template_params"),
         rate_limit_per_min=int(body.get("rate_limit_per_min", 60)),
+        header_image_url=body.get("header_image_url", ""),
     )
     return campaign
 
@@ -1063,7 +1064,7 @@ async def api_update_campaign(campaign_id: str, request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    allowed = {"name", "rate_limit_per_min", "template_params"}
+    allowed = {"name", "rate_limit_per_min", "template_params", "header_image_url"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
