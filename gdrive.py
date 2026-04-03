@@ -84,8 +84,8 @@ async def _list_with_api_key(folder_id: str) -> list[dict]:
 
                 file_id = f["id"]
                 name = f.get("name", "")
-                image_url = f"https://drive.google.com/uc?export=view&id={file_id}"
-                thumbnail = f.get("thumbnailLink", "")
+                image_url = f"https://lh3.googleusercontent.com/d/{file_id}"
+                thumbnail = f"https://lh3.googleusercontent.com/d/{file_id}=s200"
 
                 name_without_ext = name.rsplit(".", 1)[0] if "." in name else name
                 try:
@@ -155,8 +155,8 @@ def _list_with_service_account(folder_id: str) -> list[dict]:
 
                 file_id = f["id"]
                 name = f.get("name", "")
-                image_url = f"https://drive.google.com/uc?export=view&id={file_id}"
-                thumbnail = f.get("thumbnailLink", "")
+                image_url = f"https://lh3.googleusercontent.com/d/{file_id}"
+                thumbnail = f"https://lh3.googleusercontent.com/d/{file_id}=s200"
 
                 name_without_ext = name.rsplit(".", 1)[0] if "." in name else name
                 try:
