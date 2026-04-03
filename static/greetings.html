@@ -17,7 +17,10 @@
         .badge-completed { background: #dcfce7; color: #166534; }
         .badge-paused { background: #fef3c7; color: #92400e; }
         .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; font-weight: 600; }
-        .img-thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; }
+        .img-thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; cursor: pointer; }
+        .img-preview-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+        .img-preview-overlay.active { display: flex; }
+        .img-preview-overlay img { max-width: 90vw; max-height: 90vh; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -222,7 +225,17 @@
         </div>
     </div>
 
+<!-- Image preview overlay -->
+<div class="img-preview-overlay" id="imgPreview" onclick="this.classList.remove('active')">
+    <img id="imgPreviewSrc" src="" alt="Preview">
+</div>
+
 <script>
+function showPreview(url) {
+    document.getElementById('imgPreviewSrc').src = url;
+    document.getElementById('imgPreview').classList.add('active');
+}
+
 let csrfToken = '';
 let refreshInterval = null;
 let activeCampaignId = null;
@@ -329,7 +342,7 @@ async function loadDriveFolder() {
             <tr class="border-b border-gray-100">
                 <td class="py-2 px-3 text-gray-400">${i+1}</td>
                 <td class="py-2 px-3">
-                    <img src="${esc(img.thumbnail || img.image_url)}" class="img-thumb" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2248%22 height=%2248%22><rect fill=%22%23e5e7eb%22 width=%2248%22 height=%2248%22/><text x=%2224%22 y=%2228%22 text-anchor=%22middle%22 fill=%22%239ca3af%22 font-size=%2212%22>?</text></svg>'">
+                    <img src="${esc(img.thumbnail || img.image_url)}" class="img-thumb" onclick="showPreview('${esc(img.image_url)}')" title="Click to preview" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2248%22 height=%2248%22><rect fill=%22%23e5e7eb%22 width=%2248%22 height=%2248%22/><text x=%2224%22 y=%2228%22 text-anchor=%22middle%22 fill=%22%239ca3af%22 font-size=%2212%22>?</text></svg>'">
                 </td>
                 <td class="py-2 px-3 text-xs text-gray-600">${esc(img.name)}</td>
                 <td class="py-2 px-3">
