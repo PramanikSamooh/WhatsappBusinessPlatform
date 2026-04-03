@@ -1935,6 +1935,72 @@ async def greetings_drive_folder(request: Request):
     return {"images": images, "count": len(images)}
 
 
+@app.post("/api/greetings/create-and-send", dependencies=[Depends(require_greetings_auth_csrf)])
+async def greetings_create_and_send(request: Request, background_tasks: BackgroundTasks):
+    """Create a greeting campaign from Drive images with recipients and start it.
+
+    Body: {
+        "campaign_name": "optional name",
+        "template_name": "shubhkamnaye",
+        "language": "hi",
+        "recipients": [
+            {"phone": "919829393505", "name": "Sachin", "image_url": "https://..."},
+            ...
+        ]
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    recipients_data = body.get("recipients", [])
+    if not recipients_data:
+        raise HTTPException(status_code=400, detail="No recipients provided")
+
+    template_name = body.get("template_name", "shubhkamnaye").strip() or "shubhkamnaye"
+    language = body.get("language", "hi").strip() or "hi"
+    campaign_name = body.get("campaign_name", "").strip() or f"Greetings - {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')}"
+    rate_limit = int(os.getenv("CAMPAIGN_RATE_LIMIT", "100"))
+
+    # Create campaign
+    campaign = await create_campaign(
+        name=campaign_name,
+        template_name=template_name,
+        language=language,
+        rate_limit_per_min=rate_limit,
+        source="greetings",
+    )
+    campaign_id = campaign["id"]
+
+    # Build recipient records with extra_data for image URLs
+    records = []
+    for r in recipients_data:
+        phone = str(r.get("phone", "")).strip()
+        if not phone:
+            continue
+        record = {"phone": phone, "name": r.get("name", "")}
+        if r.get("image_url"):
+            record["extra_data"] = {"image_url": r["image_url"]}
+        records.append(record)
+
+    if not records:
+        await delete_campaign(campaign_id)
+        raise HTTPException(status_code=400, detail="No valid phone numbers provided")
+
+    result = await add_recipients(campaign_id, records)
+
+    # Auto-start
+    background_tasks.add_task(run_campaign, campaign_id)
+
+    return {
+        "status": "started",
+        "campaign_id": campaign_id,
+        "campaign_name": campaign_name,
+        "recipients": result,
+    }
+
+
 @app.delete("/api/greetings/campaigns/{campaign_id}/delete", dependencies=[Depends(require_greetings_auth_csrf)])
 async def greetings_delete_campaign(campaign_id: str):
     """Delete a greeting campaign (only draft/completed/failed)."""

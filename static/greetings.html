@@ -420,61 +420,42 @@ async function createDriveCampaign() {
         return;
     }
 
-    if (!confirm(`Send greetings to ${records.length} recipients? (${skipped} rows skipped — no phone number)`)) return;
+    const confirmMsg = skipped > 0
+        ? `Send greetings to ${records.length} recipients? (${skipped} images have no phone number and will be skipped)`
+        : `Send greetings to ${records.length} recipients?`;
+    if (!confirm(confirmMsg)) return;
 
     const btn = document.getElementById('driveCreateBtn');
     btn.disabled = true; btn.textContent = 'Creating...';
 
     const templateName = document.getElementById('driveTemplateName').value.trim() || 'shubhkamnaye';
-    const campaignName = document.getElementById('driveCampaignName').value.trim() || undefined;
+    const campaignName = document.getElementById('driveCampaignName').value.trim() || '';
 
     try {
-        // Step 1: Create campaign via Excel upload endpoint (reuse) with JSON body
-        const formData = new FormData();
-
-        // Build a minimal Excel-like payload — actually, let's use the recipients API directly
-        // First create campaign
-        const cResp = await api('/api/campaigns', {
+        const resp = await api('/api/greetings/create-and-send', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
-                name: campaignName || `Greetings - ${new Date().toLocaleString('en-IN', {timeZone:'Asia/Kolkata', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'})}`,
+                campaign_name: campaignName,
                 template_name: templateName,
                 language: 'hi',
-                rate_limit_per_min: 100,
+                recipients: records.map(r => ({
+                    phone: r.phone,
+                    name: r.name,
+                    image_url: r.extra_data?.image_url || '',
+                })),
             }),
         });
-        if (!cResp.ok) { const d = await cResp.json().catch(()=>({})); throw new Error(d.detail || 'Failed to create campaign'); }
-        const campaign = await cResp.json();
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Failed to create campaign');
 
-        // Mark as greetings source
-        await api(`/api/campaigns/${campaign.id}`, {
-            method: 'PATCH',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ source: 'greetings' }),
-        });
-
-        // Step 2: Add recipients with extra_data
-        const rResp = await api(`/api/campaigns/${campaign.id}/recipients`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ recipients: records }),
-        });
-        if (!rResp.ok) { const d = await rResp.json().catch(()=>({})); throw new Error(d.detail || 'Failed to add recipients'); }
-
-        // Step 3: Start campaign
-        const sResp = await api(`/api/campaigns/${campaign.id}/start`, {
-            method: 'POST',
-        });
-        if (!sResp.ok) { const d = await sResp.json().catch(()=>({})); throw new Error(d.detail || 'Failed to start campaign'); }
-
-        successEl.textContent = `Campaign started! ${records.length} recipients.`;
+        successEl.textContent = `Campaign started! ${data.recipients?.added || records.length} recipients.`;
         successEl.classList.remove('hidden');
         clearDriveImages();
         document.getElementById('driveFolderId').value = '';
         document.getElementById('driveCampaignName').value = '';
         loadCampaigns();
-        showCampaignDetail(campaign.id);
+        showCampaignDetail(data.campaign_id);
     } catch(e) {
         errEl.textContent = 'Error: ' + e.message;
         errEl.classList.remove('hidden');
