@@ -24,7 +24,10 @@ from campaign_db import (
     update_campaign,
     update_recipient_status,
 )
-from whatsapp_messaging import send_whatsapp_template
+from whatsapp_messaging import send_marketing_template, send_whatsapp_template
+
+# Use Marketing Messages API for campaigns (better delivery rates via Meta's AI optimization)
+USE_MARKETING_API = os.getenv("USE_MARKETING_API", "true").lower() in ("true", "1", "yes")
 
 # Global tracking of running campaigns (campaign_id → should_pause flag)
 _running_campaigns: dict[str, bool] = {}
@@ -79,6 +82,7 @@ async def run_campaign(campaign_id: str) -> None:
     language = campaign.get("language", "en")
     template_params = campaign.get("template_params") or []
     campaign_header_image = campaign.get("header_image_url", "")
+    campaign_category = (campaign.get("template_category") or "").upper()
 
     # Mark as running
     _running_campaigns[campaign_id] = False
@@ -140,12 +144,21 @@ async def run_campaign(campaign_id: str) -> None:
                 await bucket.acquire()
 
                 try:
-                    result = await send_whatsapp_template(
-                        to_phone=phone,
-                        template_name=template_name,
-                        language=language,
-                        components=components if components else None,
-                    )
+                    # Use Marketing Messages API for better delivery (MM Lite)
+                    if USE_MARKETING_API and campaign_category == "MARKETING":
+                        result = await send_marketing_template(
+                            to_phone=phone,
+                            template_name=template_name,
+                            language=language,
+                            components=components if components else None,
+                        )
+                    else:
+                        result = await send_whatsapp_template(
+                            to_phone=phone,
+                            template_name=template_name,
+                            language=language,
+                            components=components if components else None,
+                        )
 
                     if result.get("success"):
                         wa_mid = result.get("wa_message_id", "")

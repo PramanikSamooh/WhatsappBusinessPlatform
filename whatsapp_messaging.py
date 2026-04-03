@@ -294,6 +294,86 @@ async def send_whatsapp_template(
         return {"success": False, "error": str(e)[:200]}
 
 
+# Marketing Messages API URL (MM Lite)
+MARKETING_API_URL = (
+    f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/marketing_messages"
+)
+
+
+async def send_marketing_template(
+    to_phone: str,
+    template_name: str,
+    language: str = "en",
+    components: list | None = None,
+    ttl_seconds: int | None = None,
+) -> dict:
+    """Send a marketing template via the Marketing Messages (MM Lite) API.
+
+    Uses Meta's AI-optimized delivery for better reach and timing.
+    Falls back to regular Cloud API if MM Lite endpoint fails.
+
+    Args:
+        to_phone: Recipient phone number (E.164 without +)
+        template_name: Approved template name
+        language: Template language code
+        components: Optional template components (header, body, button params)
+        ttl_seconds: Optional TTL — if Meta can't deliver within this time, stop trying.
+                     Useful for time-sensitive promotions.
+
+    Returns:
+        {"success": True, "wa_message_id": "wamid.xxx"} on success,
+        {"success": False, "error": "..."} on failure.
+    """
+    if not all([WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID]):
+        logger.warning("WhatsApp credentials not configured, skipping marketing template")
+        return {"success": False, "error": "WhatsApp credentials not configured"}
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    template_obj = {
+        "name": template_name,
+        "language": {"code": language},
+    }
+    if components:
+        template_obj["components"] = components
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_phone,
+        "type": "template",
+        "template": template_obj,
+    }
+    if ttl_seconds and ttl_seconds > 0:
+        payload["message_send_ttl_seconds"] = ttl_seconds
+
+    try:
+        session = await _get_session()
+        async with session.post(
+                MARKETING_API_URL,
+                json=payload,
+                headers=headers,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    wa_message_id = ""
+                    messages = data.get("messages", [])
+                    if messages:
+                        wa_message_id = messages[0].get("id", "")
+                    logger.info(f"Marketing template '{template_name}' sent to {to_phone} (wamid: {wa_message_id})")
+                    return {"success": True, "wa_message_id": wa_message_id}
+                else:
+                    body = await resp.text()
+                    logger.warning(f"Marketing template send failed {resp.status}: {body}")
+                    return {"success": False, "error": body[:200]}
+    except Exception as e:
+        logger.error(f"Failed to send marketing template to {to_phone}: {e}")
+        return {"success": False, "error": str(e)[:200]}
+
+
 async def _resolve_waba_id() -> str:
     """Resolve the WhatsApp Business Account ID.
 
