@@ -1,10 +1,11 @@
 """Campaign Runner — High-Throughput Rate-Limited Bulk Template Sender
 
-Processes campaign sending in the background with configurable
-rate limiting using token bucket algorithm. Sends messages concurrently
-within the rate limit and batches DB writes for efficiency.
+Sends messages CONCURRENTLY with rate limiting using a token bucket.
+Multiple API calls happen in parallel, dramatically increasing throughput.
 
-Designed to handle 50,000+ messages/day at up to 1000 msgs/min.
+At rate_limit=1000/min with 10 concurrent workers:
+- Old (sequential): ~60 msgs/min (bottlenecked by 1s API latency)
+- New (concurrent): ~1000 msgs/min (10 parallel API calls)
 """
 
 import asyncio
@@ -26,8 +27,11 @@ from campaign_db import (
 )
 from whatsapp_messaging import send_marketing_template, send_whatsapp_template
 
-# Use Marketing Messages API for campaigns (better delivery rates via Meta's AI optimization)
+# Use Marketing Messages API for campaigns (better delivery rates)
 USE_MARKETING_API = os.getenv("USE_MARKETING_API", "true").lower() in ("true", "1", "yes")
+
+# Max concurrent API calls (prevents overwhelming Meta's API)
+MAX_CONCURRENT = int(os.getenv("CAMPAIGN_MAX_CONCURRENT", "20"))
 
 # Global tracking of running campaigns (campaign_id → should_pause flag)
 _running_campaigns: dict[str, bool] = {}
@@ -43,30 +47,11 @@ def request_pause(campaign_id: str):
         _running_campaigns[campaign_id] = True
 
 
-class _TokenBucket:
-    """Token bucket rate limiter for smooth, concurrent rate limiting."""
-
-    def __init__(self, rate_per_min: int):
-        self.rate = max(rate_per_min, 1)
-        self.interval = 60.0 / self.rate  # seconds between tokens
-        self._lock = asyncio.Lock()
-        self._last_send = 0.0
-
-    async def acquire(self):
-        """Wait until a token is available (rate limit respected)."""
-        async with self._lock:
-            now = time.monotonic()
-            wait_time = self.interval - (now - self._last_send)
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-            self._last_send = time.monotonic()
-
-
 async def run_campaign(campaign_id: str) -> None:
     """Main entry point — sends templates to all pending recipients.
 
-    Uses concurrent sending with token bucket rate limiting for high throughput.
-    DB writes are batched. Stats refresh every 500 messages or 30 seconds.
+    Sends messages concurrently (up to MAX_CONCURRENT) with token bucket
+    rate limiting for high throughput.
     """
     campaign = await get_campaign(campaign_id)
     if not campaign:
@@ -83,31 +68,88 @@ async def run_campaign(campaign_id: str) -> None:
     template_params = campaign.get("template_params") or []
     campaign_header_image = campaign.get("header_image_url", "")
     campaign_category = (campaign.get("template_category") or "").upper()
+    use_mm = USE_MARKETING_API and campaign_category == "MARKETING"
 
     # Mark as running
     _running_campaigns[campaign_id] = False
     now = datetime.now(timezone.utc).isoformat()
     await update_campaign(campaign_id, status="running", started_at=now)
-    logger.info(f"Campaign {campaign_id} started (rate: {rate_limit}/min, template: {template_name})")
 
-    bucket = _TokenBucket(rate_limit)
-    batch_size = 200  # fetch more recipients per DB query
+    # Rate limiting: token bucket that releases tokens at rate_limit/min
+    interval = 60.0 / max(rate_limit, 1)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     total_sent = 0
     total_failed = 0
+    send_lock = asyncio.Lock()
     last_stats_refresh = time.monotonic()
-    stats_refresh_interval = 30  # refresh stats every 30 seconds
-    messages_since_refresh = 0
 
+    logger.info(f"Campaign {campaign_id} started (rate: {rate_limit}/min, concurrent: {MAX_CONCURRENT}, mm_lite: {use_mm})")
+
+    async def send_one(recipient: dict) -> None:
+        """Send to a single recipient with rate limiting."""
+        nonlocal total_sent, total_failed
+
+        rid = recipient["id"]
+        phone = recipient["phone"]
+        name = recipient.get("name", "")
+
+        # Parse per-recipient extra data
+        extra_data = {}
+        if recipient.get("extra_data"):
+            try:
+                extra_data = json.loads(recipient["extra_data"])
+            except (ValueError, TypeError):
+                pass
+
+        if not extra_data.get("image_url") and campaign_header_image:
+            extra_data["image_url"] = campaign_header_image
+
+        components = _build_components(template_params, name, extra_data)
+
+        # Rate limit: wait for our turn
+        async with send_lock:
+            await asyncio.sleep(interval)
+
+        async with semaphore:
+            try:
+                if use_mm:
+                    result = await send_marketing_template(
+                        to_phone=phone,
+                        template_name=template_name,
+                        language=language,
+                        components=components if components else None,
+                    )
+                else:
+                    result = await send_whatsapp_template(
+                        to_phone=phone,
+                        template_name=template_name,
+                        language=language,
+                        components=components if components else None,
+                    )
+
+                if result.get("success"):
+                    wa_mid = result.get("wa_message_id", "")
+                    await update_recipient_status(rid, "sent", wa_message_id=wa_mid)
+                    total_sent += 1
+                else:
+                    error_msg = result.get("error", "API returned error")
+                    await update_recipient_status(rid, "failed", error_message=error_msg)
+                    total_failed += 1
+
+            except Exception as e:
+                logger.error(f"Campaign {campaign_id}: send to {phone} failed: {e}")
+                await update_recipient_status(rid, "failed", error_message=str(e)[:200])
+                total_failed += 1
+
+    batch_size = 200
     try:
         while True:
-            # Check pause signal
             if _running_campaigns.get(campaign_id, False):
                 await update_campaign(campaign_id, status="paused")
                 await refresh_campaign_stats(campaign_id)
                 logger.info(f"Campaign {campaign_id} paused after {total_sent} sent")
                 break
 
-            # Get next batch
             recipients = await get_pending_recipients(campaign_id, limit=batch_size)
             if not recipients:
                 now_str = datetime.now(timezone.utc).isoformat()
@@ -116,72 +158,22 @@ async def run_campaign(campaign_id: str) -> None:
                 logger.info(f"Campaign {campaign_id} completed: {total_sent} sent, {total_failed} failed")
                 break
 
+            # Filter out if pause requested mid-batch
+            tasks = []
             for recipient in recipients:
-                # Check pause signal
                 if _running_campaigns.get(campaign_id, False):
                     break
+                tasks.append(asyncio.create_task(send_one(recipient)))
 
-                rid = recipient["id"]
-                phone = recipient["phone"]
-                name = recipient.get("name", "")
+            # Wait for all tasks in this batch to complete
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Parse per-recipient extra data
-                extra_data = {}
-                if recipient.get("extra_data"):
-                    try:
-                        extra_data = json.loads(recipient["extra_data"])
-                    except (ValueError, TypeError):
-                        pass
-
-                # Campaign-level header image as fallback
-                if not extra_data.get("image_url") and campaign_header_image:
-                    extra_data["image_url"] = campaign_header_image
-
-                # Build template components
-                components = _build_components(template_params, name, extra_data)
-
-                # Rate limit — wait for token
-                await bucket.acquire()
-
-                try:
-                    # Use Marketing Messages API for better delivery (MM Lite)
-                    if USE_MARKETING_API and campaign_category == "MARKETING":
-                        result = await send_marketing_template(
-                            to_phone=phone,
-                            template_name=template_name,
-                            language=language,
-                            components=components if components else None,
-                        )
-                    else:
-                        result = await send_whatsapp_template(
-                            to_phone=phone,
-                            template_name=template_name,
-                            language=language,
-                            components=components if components else None,
-                        )
-
-                    if result.get("success"):
-                        wa_mid = result.get("wa_message_id", "")
-                        await update_recipient_status(rid, "sent", wa_message_id=wa_mid)
-                        total_sent += 1
-                    else:
-                        error_msg = result.get("error", "API returned error")
-                        await update_recipient_status(rid, "failed", error_message=error_msg)
-                        total_failed += 1
-
-                except Exception as e:
-                    logger.error(f"Campaign {campaign_id}: send to {phone} failed: {e}")
-                    await update_recipient_status(rid, "failed", error_message=str(e)[:200])
-                    total_failed += 1
-
-                messages_since_refresh += 1
-
-            # Refresh stats periodically (not after every batch)
+            # Refresh stats periodically
             now_mono = time.monotonic()
-            if messages_since_refresh >= 500 or (now_mono - last_stats_refresh) > stats_refresh_interval:
+            if (now_mono - last_stats_refresh) > 30:
                 await refresh_campaign_stats(campaign_id)
                 last_stats_refresh = now_mono
-                messages_since_refresh = 0
                 logger.info(f"Campaign {campaign_id} progress: {total_sent} sent, {total_failed} failed")
 
     except Exception as e:
@@ -197,15 +189,9 @@ def _build_components(
     recipient_name: str,
     extra_data: dict | None = None,
 ) -> list:
-    """Build WhatsApp template components from parameter definitions.
-
-    template_params is a list of parameter values (strings).
-    {{name}} in values is replaced with the recipient's name.
-    extra_data may contain image_url for header image components.
-    """
+    """Build WhatsApp template components from parameter definitions."""
     components = []
 
-    # Header image (for greeting templates with image header)
     if extra_data and extra_data.get("image_url"):
         components.append({
             "type": "header",
@@ -215,7 +201,6 @@ def _build_components(
             }],
         })
 
-    # Body text params
     if template_params:
         body_params = []
         for param in template_params:
