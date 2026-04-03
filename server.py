@@ -1067,8 +1067,15 @@ async def api_contact_by_phone(phone: str):
 
 @app.get("/api/campaigns", dependencies=[Depends(require_auth)])
 async def api_list_campaigns(limit: int = 100, status: str = ""):
-    """List campaigns with optional status filter."""
+    """List campaigns with optional status filter. Stats are real-time from recipients table."""
     campaigns = await list_campaigns(limit, status)
+    # Enrich with real-time stats (fixes stale cached counters)
+    for c in campaigns:
+        stats = await get_recipient_stats(c["id"])
+        c["sent_count"] = stats.get("sent", 0)
+        c["delivered_count"] = stats.get("delivered", 0)
+        c["read_count"] = stats.get("read", 0)
+        c["failed_count"] = stats.get("failed", 0)
     return {"campaigns": campaigns, "count": len(campaigns)}
 
 
@@ -1867,9 +1874,15 @@ async def greetings_upload(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/api/greetings/campaigns", dependencies=[Depends(require_greetings_auth)])
 async def greetings_list_campaigns(limit: int = 50):
-    """List greeting campaigns (filtered by source='greetings')."""
+    """List greeting campaigns (filtered by source='greetings'). Stats are real-time."""
     all_campaigns = await list_campaigns(limit=limit)
     greeting_campaigns = [c for c in all_campaigns if c.get("source") == "greetings"]
+    for c in greeting_campaigns:
+        stats = await get_recipient_stats(c["id"])
+        c["sent_count"] = stats.get("sent", 0)
+        c["delivered_count"] = stats.get("delivered", 0)
+        c["read_count"] = stats.get("read", 0)
+        c["failed_count"] = stats.get("failed", 0)
     return {"campaigns": greeting_campaigns, "count": len(greeting_campaigns)}
 
 
