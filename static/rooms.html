@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gunayatan - Room Confirmations</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+        .badge-pending { background: #f3f4f6; color: #6b7280; }
+        .badge-sent { background: #dbeafe; color: #1e40af; }
+        .badge-delivered { background: #fef3c7; color: #92400e; }
+        .badge-read { background: #dcfce7; color: #166534; }
+        .badge-failed { background: #fee2e2; color: #991b1b; }
+        .badge-draft { background: #f3f4f6; color: #6b7280; }
+        .badge-running { background: #dbeafe; color: #1e40af; }
+        .badge-completed { background: #dcfce7; color: #166534; }
+        .badge-paused { background: #fef3c7; color: #92400e; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <!-- Login -->
+    <div id="loginScreen" class="flex items-center justify-center min-h-screen">
+        <div class="bg-white rounded-xl shadow-lg p-8 w-full max-w-sm">
+            <h1 class="text-2xl font-bold text-center mb-2 text-gray-800">Room Confirmations</h1>
+            <p class="text-gray-500 text-center mb-6 text-sm">Gunayatan Dharamshala / Bhawan Booking</p>
+            <div id="loginError" class="hidden bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm"></div>
+            <input id="loginPassword" type="password" placeholder="Enter password"
+                class="w-full border border-gray-300 rounded-lg px-4 py-3 mb-4 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                onkeydown="if(event.key==='Enter') doLogin()">
+            <button onclick="doLogin()" class="w-full bg-blue-600 text-white rounded-lg px-4 py-3 font-medium hover:bg-blue-700 transition">Login</button>
+        </div>
+    </div>
+
+    <!-- App -->
+    <div id="appScreen" class="hidden">
+        <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
+            <div>
+                <h1 class="text-lg font-bold text-gray-800">Room Confirmations</h1>
+                <p class="text-xs text-gray-500">Gunayatan Dharamshala / Bhawan Booking</p>
+            </div>
+            <button onclick="doLogout()" class="text-sm text-gray-500 hover:text-red-500">Logout</button>
+        </header>
+
+        <div class="max-w-5xl mx-auto p-4 space-y-6">
+            <!-- Upload -->
+            <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                <h2 class="text-lg font-semibold mb-3">Send Room Confirmations</h2>
+                <p class="text-sm text-gray-500 mb-4">
+                    Upload Excel with columns: <strong>NAME</strong>, <strong>CITY</strong>, <strong>MOB</strong>, <strong>DATE OF ARRIVING</strong>, <strong>DATE OF DEPARTURE</strong>, <strong>BHAWAN</strong>, <strong>ROOM NO</strong>, <strong>CONTACT PERSON GUNAYATAN</strong>, <strong>CONTACT PERSON BHAWAN</strong>
+                    <br><span class="text-xs text-gray-400">Contact columns format: "NAME - PHONE" (e.g., "SANJAY JAIN - 8969274940")</span>
+                </p>
+
+                <div id="uploadError" class="hidden bg-red-50 text-red-600 p-3 rounded-lg mb-4 text-sm"></div>
+                <div id="uploadSuccess" class="hidden bg-green-50 text-green-700 p-3 rounded-lg mb-4 text-sm"></div>
+
+                <!-- Confirmation box -->
+                <div id="confirmBox" class="hidden bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+                    <p class="text-sm font-medium text-blue-800 mb-2" id="confirmText"></p>
+                    <div class="flex gap-3">
+                        <button onclick="doStartCampaign()" id="confirmSendBtn"
+                            class="bg-green-600 text-white rounded-lg px-5 py-2 text-sm font-medium hover:bg-green-700 transition">Send Now</button>
+                        <button onclick="cancelCampaign()"
+                            class="bg-gray-200 text-gray-700 rounded-lg px-5 py-2 text-sm hover:bg-gray-300 transition">Cancel</button>
+                    </div>
+                </div>
+
+                <form id="uploadForm" onsubmit="doUpload(event)" class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Excel File</label>
+                        <input type="file" id="fileInput" accept=".xlsx,.xls" required
+                            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm file:mr-3 file:py-1 file:px-3 file:rounded-md file:border-0 file:bg-blue-50 file:text-blue-700 file:font-medium file:cursor-pointer">
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Template Name</label>
+                            <input type="text" id="templateName" value="room_confirmation"
+                                class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Language</label>
+                            <select id="templateLang" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <option value="hi">Hindi</option>
+                                <option value="en">English</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Campaign Name (optional)</label>
+                        <input type="text" id="campaignName" placeholder="Auto-generated if empty"
+                            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                    </div>
+                    <button type="submit" id="uploadBtn"
+                        class="bg-blue-600 text-white rounded-lg px-6 py-2.5 font-medium hover:bg-blue-700 transition text-sm">Upload</button>
+                </form>
+            </div>
+
+            <!-- Campaign History -->
+            <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold">Campaign History</h2>
+                    <button onclick="loadCampaigns()" class="text-sm text-blue-600 hover:text-blue-800">Refresh</button>
+                </div>
+                <div id="campaignsList" class="space-y-3"><p class="text-gray-400 text-sm">Loading...</p></div>
+            </div>
+
+            <!-- Campaign Detail -->
+            <div id="campaignDetail" class="hidden bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold" id="detailTitle">Campaign Detail</h2>
+                    <button onclick="closeCampaignDetail()" class="text-sm text-gray-500 hover:text-gray-700">Close</button>
+                </div>
+                <div id="detailStats" class="grid grid-cols-5 gap-3 mb-4"></div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="border-b text-left text-gray-500">
+                                <th class="py-2 px-2">Name</th>
+                                <th class="py-2 px-2">Phone</th>
+                                <th class="py-2 px-2">Status</th>
+                                <th class="py-2 px-2">Sent At</th>
+                                <th class="py-2 px-2">Error</th>
+                            </tr>
+                        </thead>
+                        <tbody id="detailRecipients"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+let csrfToken = '';
+let refreshInterval = null;
+let activeCampaignId = null;
+let pendingCampaignId = null;
+
+function getCookie(name) {
+    const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return m ? m[2] : '';
+}
+function fmtDate(d) {
+    if (!d) return '-';
+    const dt = new Date(d.includes('T') ? (d.endsWith('Z') ? d : d+'Z') : d+'Z');
+    return isNaN(dt) ? '-' : dt.toLocaleString('en-IN', {timeZone:'Asia/Kolkata', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'});
+}
+function fmtTime(d) {
+    if (!d) return '-';
+    const dt = new Date(d.includes('T') ? (d.endsWith('Z') ? d : d+'Z') : d+'Z');
+    return isNaN(dt) ? '-' : dt.toLocaleString('en-IN', {timeZone:'Asia/Kolkata', hour:'2-digit', minute:'2-digit'});
+}
+function shortError(e) {
+    if (!e) return '';
+    if (e.includes('131049')) return 'Ecosystem limit';
+    if (e.includes('131026')) return 'Not on WhatsApp';
+    if (e.includes('131047')) return 'Re-engagement needed';
+    if (e.includes('131053')) return 'Media error';
+    if (e.includes('130472')) return 'Template paused';
+    if (e.includes('132000')) return 'Param mismatch';
+    return e.length > 40 ? e.substring(0,40)+'...' : e;
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
+
+async function api(url, opts = {}) {
+    const headers = opts.headers || {};
+    if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+    const resp = await fetch(url, { ...opts, headers, credentials: 'include' });
+    if (resp.status === 401) { showLogin(); throw new Error('Unauthorized'); }
+    return resp;
+}
+
+function showLogin() {
+    document.getElementById('loginScreen').classList.remove('hidden');
+    document.getElementById('appScreen').classList.add('hidden');
+    if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+}
+function showApp() {
+    document.getElementById('loginScreen').classList.add('hidden');
+    document.getElementById('appScreen').classList.remove('hidden');
+    loadCampaigns();
+}
+async function checkAuth() {
+    try {
+        const r = await fetch('/auth/rooms-check', {credentials:'include'});
+        const d = await r.json();
+        if (d.authenticated) { csrfToken = getCookie('rooms_csrf'); showApp(); } else showLogin();
+    } catch { showLogin(); }
+}
+async function doLogin() {
+    const pw = document.getElementById('loginPassword').value;
+    const err = document.getElementById('loginError');
+    err.classList.add('hidden');
+    try {
+        const r = await fetch('/auth/rooms-login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pw}), credentials:'include'});
+        if (r.ok) { const d = await r.json(); csrfToken = getCookie('rooms_csrf') || d.csrf_token; showApp(); }
+        else { err.textContent = r.status===429 ? 'Too many attempts. Wait 10 minutes.' : 'Invalid password'; err.classList.remove('hidden'); }
+    } catch(e) { err.textContent = 'Login failed: '+e.message; err.classList.remove('hidden'); }
+}
+async function doLogout() { await fetch('/auth/rooms-logout',{method:'POST',credentials:'include'}); showLogin(); }
+
+async function doUpload(event) {
+    event.preventDefault();
+    const btn = document.getElementById('uploadBtn');
+    const errEl = document.getElementById('uploadError');
+    const successEl = document.getElementById('uploadSuccess');
+    const confirmBox = document.getElementById('confirmBox');
+    errEl.classList.add('hidden'); successEl.classList.add('hidden'); confirmBox.classList.add('hidden');
+
+    const fileInput = document.getElementById('fileInput');
+    if (!fileInput.files.length) return;
+
+    btn.disabled = true; btn.textContent = 'Uploading...';
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+    formData.append('template_name', document.getElementById('templateName').value);
+    formData.append('language', document.getElementById('templateLang').value);
+    formData.append('campaign_name', document.getElementById('campaignName').value);
+
+    try {
+        const resp = await api('/api/rooms/upload', {method:'POST', body:formData});
+        let data;
+        const ct = resp.headers.get('content-type')||'';
+        if (ct.includes('application/json')) data = await resp.json();
+        else { const t = await resp.text(); data = {detail: t||`Server error (${resp.status})`}; }
+
+        if (resp.ok) {
+            pendingCampaignId = data.campaign_id;
+            document.getElementById('confirmText').textContent = `${data.recipients?.added||0} room confirmations loaded. Template: ${data.template||'room_confirmation'}. Ready to send?`;
+            confirmBox.classList.remove('hidden');
+            loadCampaigns();
+        } else {
+            errEl.textContent = data.detail || `Upload failed (${resp.status})`;
+            errEl.classList.remove('hidden');
+        }
+    } catch(e) { errEl.textContent = 'Upload error: '+e.message; errEl.classList.remove('hidden'); }
+    finally { btn.disabled = false; btn.textContent = 'Upload'; }
+}
+
+async function doStartCampaign() {
+    if (!pendingCampaignId) return;
+    const btn = document.getElementById('confirmSendBtn');
+    btn.disabled = true; btn.textContent = 'Starting...';
+    try {
+        const resp = await api(`/api/rooms/campaigns/${pendingCampaignId}/start`, {method:'POST'});
+        if (resp.ok) {
+            document.getElementById('confirmBox').classList.add('hidden');
+            document.getElementById('uploadSuccess').textContent = 'Campaign started!';
+            document.getElementById('uploadSuccess').classList.remove('hidden');
+            document.getElementById('fileInput').value = '';
+            document.getElementById('campaignName').value = '';
+            loadCampaigns();
+            showCampaignDetail(pendingCampaignId);
+            pendingCampaignId = null;
+        } else {
+            const d = await resp.json().catch(()=>({}));
+            document.getElementById('uploadError').textContent = d.detail||'Failed to start';
+            document.getElementById('uploadError').classList.remove('hidden');
+        }
+    } catch(e) { document.getElementById('uploadError').textContent = 'Error: '+e.message; document.getElementById('uploadError').classList.remove('hidden'); }
+    finally { btn.disabled = false; btn.textContent = 'Send Now'; }
+}
+
+async function cancelCampaign() {
+    if (pendingCampaignId) { try { await api(`/api/rooms/campaigns/${pendingCampaignId}/delete`,{method:'DELETE'}); } catch{} pendingCampaignId = null; }
+    document.getElementById('confirmBox').classList.add('hidden');
+    loadCampaigns();
+}
+
+async function loadCampaigns() {
+    try {
+        const resp = await api('/api/rooms/campaigns');
+        const data = await resp.json();
+        const list = document.getElementById('campaignsList');
+        if (!data.campaigns?.length) { list.innerHTML = '<p class="text-gray-400 text-sm">No room campaigns yet.</p>'; return; }
+
+        list.innerHTML = data.campaigns.map(c => {
+            const total = c.recipient_count||0;
+            const sent = (c.sent_count||0)+(c.delivered_count||0)+(c.read_count||0);
+            const failed = c.failed_count||0;
+            const canDel = c.status !== 'running';
+            return `
+                <div class="border border-gray-200 rounded-lg p-4 hover:bg-gray-50 transition">
+                    <div class="flex items-center justify-between">
+                        <div class="cursor-pointer flex-1" onclick="showCampaignDetail('${c.id}')">
+                            <span class="font-medium text-gray-800">${esc(c.name)}</span>
+                            <span class="badge badge-${c.status} ml-2">${c.status}</span>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <span class="text-xs text-gray-400">${fmtDate(c.created_at)}</span>
+                            ${canDel ? `<button onclick="event.stopPropagation();deleteCampaign('${c.id}','${esc(c.name)}')" class="text-xs text-red-400 hover:text-red-600" title="Delete">&#10005;</button>` : ''}
+                        </div>
+                    </div>
+                    <div class="mt-2 text-xs text-gray-500 cursor-pointer" onclick="showCampaignDetail('${c.id}')">
+                        ${total} recipients | ${sent} sent | ${failed} failed | Template: ${esc(c.template_name)}
+                    </div>
+                </div>`;
+        }).join('');
+    } catch(e) { console.error('Load campaigns:',e); }
+}
+
+async function deleteCampaign(id, name) {
+    if (!confirm(`Delete campaign "${name}"?`)) return;
+    try { await api(`/api/rooms/campaigns/${id}/delete`,{method:'DELETE'}); if (activeCampaignId===id) closeCampaignDetail(); loadCampaigns(); }
+    catch(e) { alert('Delete failed: '+e.message); }
+}
+
+async function showCampaignDetail(id) {
+    activeCampaignId = id;
+    document.getElementById('campaignDetail').classList.remove('hidden');
+    if (refreshInterval) clearInterval(refreshInterval);
+    refreshInterval = setInterval(() => refreshCampaignDetail(id), 5000);
+    await refreshCampaignDetail(id);
+}
+
+async function refreshCampaignDetail(id) {
+    try {
+        const resp = await api(`/api/rooms/campaigns/${id}`);
+        const c = await resp.json();
+        document.getElementById('detailTitle').textContent = c.name || 'Campaign';
+        const s = c.recipient_stats || {};
+        document.getElementById('detailStats').innerHTML = `
+            <div class="bg-gray-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-gray-800">${s.total||0}</div><div class="text-xs text-gray-500">Total</div></div>
+            <div class="bg-blue-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-blue-600">${s.sent||0}</div><div class="text-xs text-gray-500">Sent</div></div>
+            <div class="bg-yellow-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-yellow-600">${s.delivered||0}</div><div class="text-xs text-gray-500">Delivered</div></div>
+            <div class="bg-green-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-green-600">${s.read||0}</div><div class="text-xs text-gray-500">Read</div></div>
+            <div class="bg-red-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-red-600">${s.failed||0}</div><div class="text-xs text-gray-500">Failed</div></div>`;
+
+        document.getElementById('detailRecipients').innerHTML = (c.recipients||[]).map(r => {
+            const errHtml = r.error_message ? `<span class="text-red-500 text-xs" title="${esc(r.error_message)}">${esc(shortError(r.error_message))}</span>` : '';
+            return `<tr class="border-b border-gray-100">
+                <td class="py-2 px-2">${esc(r.name||'-')}</td>
+                <td class="py-2 px-2 font-mono text-xs">${esc(r.phone)}</td>
+                <td class="py-2 px-2"><span class="badge badge-${r.status}">${r.status}</span></td>
+                <td class="py-2 px-2 text-xs text-gray-500">${fmtTime(r.sent_at)}</td>
+                <td class="py-2 px-2">${errHtml}</td>
+            </tr>`;
+        }).join('');
+
+        if (c.status==='completed'||c.status==='failed') { if (refreshInterval) { clearInterval(refreshInterval); refreshInterval=null; } }
+    } catch(e) { console.error('Refresh:',e); }
+}
+
+function closeCampaignDetail() {
+    document.getElementById('campaignDetail').classList.add('hidden');
+    activeCampaignId = null;
+    if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+}
+
+checkAuth();
+</script>
+</body>
+</html>

@@ -115,6 +115,7 @@ SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "")
 # Security config
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 GREETINGS_PASSWORD = os.getenv("GREETINGS_PASSWORD", "")
+ROOMS_PASSWORD = os.getenv("ROOMS_PASSWORD", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 SESSION_EXPIRY_HOURS = 24
 
@@ -324,6 +325,53 @@ async def require_greetings_auth_csrf(
     if request.method in ("POST", "PATCH", "PUT", "DELETE"):
         header_csrf = request.headers.get("X-CSRF-Token", "")
         if not greetings_csrf or not header_csrf or greetings_csrf != header_csrf:
+            raise HTTPException(status_code=403, detail="CSRF token mismatch")
+
+
+# --- Rooms auth (separate session store for room allotment team) ---
+
+rooms_sessions: dict[str, datetime] = {}
+
+
+def create_rooms_session() -> str:
+    token = secrets.token_urlsafe(32)
+    rooms_sessions[token] = datetime.now(timezone.utc) + timedelta(hours=SESSION_EXPIRY_HOURS)
+    now = datetime.now(timezone.utc)
+    expired = [t for t, exp in rooms_sessions.items() if exp < now]
+    for t in expired:
+        del rooms_sessions[t]
+    return token
+
+
+def verify_rooms_session(token: str) -> bool:
+    if not token or token not in rooms_sessions:
+        return False
+    if rooms_sessions[token] < datetime.now(timezone.utc):
+        del rooms_sessions[token]
+        return False
+    return True
+
+
+async def require_rooms_auth(rooms_session: str = Cookie(default="")):
+    if not ROOMS_PASSWORD:
+        return
+    if verify_rooms_session(rooms_session):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def require_rooms_auth_csrf(
+    request: Request,
+    rooms_session: str = Cookie(default=""),
+    rooms_csrf: str = Cookie(default=""),
+):
+    if not ROOMS_PASSWORD:
+        return
+    if not verify_rooms_session(rooms_session):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if request.method in ("POST", "PATCH", "PUT", "DELETE"):
+        header_csrf = request.headers.get("X-CSRF-Token", "")
+        if not rooms_csrf or not header_csrf or rooms_csrf != header_csrf:
             raise HTTPException(status_code=403, detail="CSRF token mismatch")
 
 
@@ -2017,6 +2065,312 @@ async def greetings_create_and_send(request: Request, background_tasks: Backgrou
 @app.delete("/api/greetings/campaigns/{campaign_id}/delete", dependencies=[Depends(require_greetings_auth_csrf)])
 async def greetings_delete_campaign(campaign_id: str):
     """Delete a greeting campaign (only draft/completed/failed)."""
+    try:
+        deleted = await delete_campaign(campaign_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"status": "deleted", "campaign_id": campaign_id}
+
+
+# --- Room Confirmations Staff Page ---
+
+
+@app.get("/rooms")
+async def rooms_page():
+    """Serve the room confirmations staff page."""
+    p = STATIC_DIR / "rooms.html"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Rooms page not found")
+    return FileResponse(str(p), media_type="text/html")
+
+
+@app.post("/auth/rooms-login")
+async def rooms_login(request: Request):
+    """Login for room confirmations staff."""
+    if not ROOMS_PASSWORD:
+        return JSONResponse({"status": "ok", "message": "Auth disabled"})
+
+    client_ip = request.client.host if request.client else "unknown"
+    _check_brute_force(client_ip)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    password = body.get("password", "")
+    if not secrets.compare_digest(password, ROOMS_PASSWORD):
+        _record_failed_login(client_ip)
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    token = create_rooms_session()
+    csrf_token = secrets.token_urlsafe(32)
+    response = JSONResponse({"status": "ok", "csrf_token": csrf_token})
+    response.set_cookie(key="rooms_session", value=token, httponly=True, secure=True, samesite="strict", max_age=SESSION_EXPIRY_HOURS * 3600)
+    response.set_cookie(key="rooms_csrf", value=csrf_token, httponly=False, secure=True, samesite="strict", max_age=SESSION_EXPIRY_HOURS * 3600)
+    logger.info("Rooms staff login successful")
+    return response
+
+
+@app.get("/auth/rooms-check")
+async def rooms_auth_check(rooms_session: str = Cookie(default="")):
+    if not ROOMS_PASSWORD:
+        return {"authenticated": True, "auth_required": False}
+    if verify_rooms_session(rooms_session):
+        return {"authenticated": True, "auth_required": True}
+    return JSONResponse({"authenticated": False, "auth_required": True}, status_code=401)
+
+
+@app.post("/auth/rooms-logout")
+async def rooms_logout(rooms_session: str = Cookie(default="")):
+    if rooms_session in rooms_sessions:
+        del rooms_sessions[rooms_session]
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie("rooms_session")
+    return response
+
+
+def _split_contact(val: str) -> tuple[str, str]:
+    """Split 'NAME - PHONE' into (name, phone). Accepts various separators."""
+    if not val:
+        return "", ""
+    s = str(val).strip()
+    # Try common separators
+    for sep in (" - ", "-", ":", "|", ","):
+        if sep in s:
+            parts = s.split(sep, 1)
+            name = parts[0].strip()
+            phone = parts[1].strip() if len(parts) > 1 else ""
+            # If phone part isn't numeric, try the other way
+            if not any(c.isdigit() for c in phone) and any(c.isdigit() for c in name):
+                name, phone = phone, name
+            return name, phone
+    # No separator — check if it's just a phone or just a name
+    if any(c.isdigit() for c in s) and sum(c.isdigit() for c in s) >= 7:
+        return "", s
+    return s, ""
+
+
+@app.post("/api/rooms/upload", dependencies=[Depends(require_rooms_auth_csrf)])
+async def rooms_upload(request: Request):
+    """Upload Excel file for room confirmations.
+
+    Expected columns (flexible naming):
+      S.N, NAME, CITY, PERSON, MOB, DATE OF ARRIVING, DATE OF DEPARTURE,
+      BHAWAN, ROOM NO, CONTACT PERSON GUNAYATAN, CONTACT PERSON BHAWAN
+    """
+    import io
+    import traceback
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl not installed on server")
+
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read form: {e}")
+
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    filename = getattr(file, "filename", "")
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are accepted")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
+
+    try:
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read Excel file: {e}")
+
+    try:
+        # Read header row
+        first_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+        if not first_row or not first_row[0]:
+            wb.close()
+            raise HTTPException(status_code=400, detail="Excel file is empty")
+
+        headers = {}
+        for idx, val in enumerate(first_row[0]):
+            if val is not None:
+                headers[str(val).strip().lower()] = idx
+
+        def find_col(*names):
+            for n in names:
+                if n in headers:
+                    return headers[n]
+            return None
+
+        col_name = find_col("name", "naam")
+        col_city = find_col("city", "shahar")
+        col_person = find_col("person", "contact")
+        col_mob = find_col("mob", "mobile", "phone", "mob.", "ph", "ph.")
+        col_arrive = find_col("date of arriving", "arrival", "arrive date", "arrive", "arriving")
+        col_depart = find_col("date of departure", "departure", "depart date", "depart", "departing")
+        col_bhawan = find_col("bhawan", "hotel", "building", "dharamshala")
+        col_room = find_col("room no", "room", "room number", "room no.")
+        col_contact_g = find_col("contact person gunayatan", "gunayatan contact", "gunayatan")
+        col_contact_b = find_col("contact person bhawan", "bhawan contact", "hotel contact", "contact person hotel")
+
+        if col_mob is None or col_name is None:
+            wb.close()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Excel must have 'NAME' and 'MOB' columns. Found: {list(headers.keys())}",
+            )
+
+        records = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row:
+                continue
+
+            def cell(idx):
+                if idx is None or idx >= len(row) or row[idx] is None:
+                    return ""
+                v = row[idx]
+                if isinstance(v, (int, float)):
+                    return str(int(v)) if v == int(v) else str(v)
+                return str(v).strip()
+
+            phone_raw = cell(col_mob)
+            if not phone_raw:
+                continue
+
+            name_val = cell(col_name)
+            city = cell(col_city)
+            arrive = cell(col_arrive)
+            depart = cell(col_depart)
+            bhawan = cell(col_bhawan)
+            room = cell(col_room)
+            contact_g = cell(col_contact_g)
+            contact_b = cell(col_contact_b)
+
+            gn_name, gn_phone = _split_contact(contact_g)
+            bn_name, bn_phone = _split_contact(contact_b)
+
+            # Build template params in order {{1}}...{{11}}
+            # {{1}}=name, {{2}}=city, {{3}}=phone, {{4}}=arrive, {{5}}=depart,
+            # {{6}}=bhawan, {{7}}=room, {{8}}=gn_name, {{9}}=gn_phone,
+            # {{10}}=bn_name, {{11}}=bn_phone
+            params = [
+                name_val or "-",
+                city or "-",
+                phone_raw or "-",
+                arrive or "-",
+                depart or "-",
+                bhawan or "-",
+                room or "-",
+                gn_name or "-",
+                gn_phone or "-",
+                bn_name or "-",
+                bn_phone or "-",
+            ]
+
+            record = {
+                "phone": phone_raw,
+                "name": name_val,
+                "extra_data": {"template_params": params},
+            }
+            records.append(record)
+
+        wb.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Rooms upload row parse error: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Error parsing Excel rows: {e}")
+
+    if not records:
+        raise HTTPException(status_code=400, detail="No valid rows found in Excel")
+
+    logger.info(f"Rooms upload: parsed {len(records)} records")
+
+    template_name = str(form.get("template_name") or "room_confirmation").strip()
+    language = str(form.get("language") or "hi").strip() or "hi"
+    campaign_name = str(form.get("campaign_name") or "").strip() or f"Rooms - {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')}"
+
+    rate_limit = int(os.getenv("CAMPAIGN_RATE_LIMIT", "100"))
+
+    campaign = await create_campaign(
+        name=campaign_name,
+        template_name=template_name,
+        language=language,
+        rate_limit_per_min=rate_limit,
+        source="rooms",
+    )
+    campaign_id = campaign["id"]
+
+    result = await add_recipients(campaign_id, records)
+
+    return {
+        "status": "draft",
+        "campaign_id": campaign_id,
+        "campaign_name": campaign_name,
+        "recipients": result,
+        "template": template_name,
+        "language": language,
+    }
+
+
+@app.get("/api/rooms/campaigns", dependencies=[Depends(require_rooms_auth)])
+async def rooms_list_campaigns(limit: int = 50):
+    all_campaigns = await list_campaigns(limit=limit)
+    room_campaigns = [c for c in all_campaigns if c.get("source") == "rooms"]
+    for c in room_campaigns:
+        stats = await get_recipient_stats(c["id"])
+        c["sent_count"] = stats.get("sent", 0)
+        c["delivered_count"] = stats.get("delivered", 0)
+        c["read_count"] = stats.get("read", 0)
+        c["failed_count"] = stats.get("failed", 0)
+    return {"campaigns": room_campaigns, "count": len(room_campaigns)}
+
+
+@app.get("/api/rooms/campaigns/{campaign_id}", dependencies=[Depends(require_rooms_auth)])
+async def rooms_campaign_status(campaign_id: str):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("source") != "rooms":
+        raise HTTPException(status_code=403, detail="Not a rooms campaign")
+    campaign["recipient_stats"] = await get_recipient_stats(campaign_id)
+    campaign["recipients"] = await list_recipients(campaign_id, limit=1000)
+    return campaign
+
+
+@app.post("/api/rooms/campaigns/{campaign_id}/start", dependencies=[Depends(require_rooms_auth_csrf)])
+async def rooms_start_campaign(campaign_id: str, background_tasks: BackgroundTasks):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("source") != "rooms":
+        raise HTTPException(status_code=403, detail="Not a rooms campaign")
+    if campaign["status"] not in ("draft", "paused"):
+        raise HTTPException(status_code=400, detail=f"Cannot start campaign with status '{campaign['status']}'")
+    if is_campaign_running(campaign_id):
+        raise HTTPException(status_code=400, detail="Campaign is already running")
+    stats = await get_recipient_stats(campaign_id)
+    if stats["total"] == 0:
+        raise HTTPException(status_code=400, detail="No recipients in campaign")
+
+    background_tasks.add_task(run_campaign, campaign_id)
+    return {"status": "starting", "campaign_id": campaign_id}
+
+
+@app.delete("/api/rooms/campaigns/{campaign_id}/delete", dependencies=[Depends(require_rooms_auth_csrf)])
+async def rooms_delete_campaign(campaign_id: str):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("source") != "rooms":
+        raise HTTPException(status_code=403, detail="Not a rooms campaign")
     try:
         deleted = await delete_campaign(campaign_id)
     except ValueError as e:

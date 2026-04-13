@@ -189,7 +189,12 @@ def _build_components(
     recipient_name: str,
     extra_data: dict | None = None,
 ) -> list:
-    """Build WhatsApp template components from parameter definitions."""
+    """Build WhatsApp template components from parameter definitions.
+
+    Priority for body params:
+      1. extra_data.template_params (per-recipient, for rooms campaigns)
+      2. campaign-level template_params (with {{name}} substitution)
+    """
     components = []
 
     if extra_data and extra_data.get("image_url"):
@@ -201,9 +206,13 @@ def _build_components(
             }],
         })
 
-    if template_params:
+    # Per-recipient params override campaign-level params
+    per_recipient_params = extra_data.get("template_params") if extra_data else None
+    params_to_use = per_recipient_params if per_recipient_params else template_params
+
+    if params_to_use:
         body_params = []
-        for param in template_params:
+        for param in params_to_use:
             value = str(param).replace("{{name}}", recipient_name or "there")
             body_params.append({"type": "text", "text": value})
         if body_params:
