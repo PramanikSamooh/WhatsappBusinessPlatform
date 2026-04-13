@@ -2217,8 +2217,14 @@ async def rooms_upload(request: Request):
         col_depart = find_col("date of departure", "departure", "depart date", "depart", "departing")
         col_bhawan = find_col("bhawan", "hotel", "building", "dharamshala")
         col_room = find_col("room no", "room", "room number", "room no.")
+        # Combined contact columns (legacy: "NAME - PHONE" in one cell)
         col_contact_g = find_col("contact person gunayatan", "gunayatan contact", "gunayatan")
         col_contact_b = find_col("contact person bhawan", "bhawan contact", "hotel contact", "contact person hotel")
+        # Separate contact columns (preferred)
+        col_gn_name = find_col("gunayatan contact name", "contact gunayatan name", "gunayatan name")
+        col_gn_phone = find_col("gunayatan contact phone", "contact gunayatan phone", "gunayatan phone", "gunayatan mob")
+        col_bn_name = find_col("bhawan contact name", "hotel contact name", "bhawan name", "contact bhawan name")
+        col_bn_phone = find_col("bhawan contact phone", "hotel contact phone", "bhawan phone", "bhawan mob", "contact bhawan phone", "hotel office")
 
         if col_mob is None or col_name is None:
             wb.close()
@@ -2250,11 +2256,18 @@ async def rooms_upload(request: Request):
             depart = cell(col_depart)
             bhawan = cell(col_bhawan)
             room = cell(col_room)
-            contact_g = cell(col_contact_g)
-            contact_b = cell(col_contact_b)
+            # Prefer separate columns; fall back to combined "NAME - PHONE" column
+            if col_gn_name is not None or col_gn_phone is not None:
+                gn_name = cell(col_gn_name)
+                gn_phone = cell(col_gn_phone)
+            else:
+                gn_name, gn_phone = _split_contact(cell(col_contact_g))
 
-            gn_name, gn_phone = _split_contact(contact_g)
-            bn_name, bn_phone = _split_contact(contact_b)
+            if col_bn_name is not None or col_bn_phone is not None:
+                bn_name = cell(col_bn_name)
+                bn_phone = cell(col_bn_phone)
+            else:
+                bn_name, bn_phone = _split_contact(cell(col_contact_b))
 
             # Build template params in order {{1}}...{{11}}
             # {{1}}=name, {{2}}=city, {{3}}=phone, {{4}}=arrive, {{5}}=depart,
