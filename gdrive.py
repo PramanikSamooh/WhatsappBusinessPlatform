@@ -27,6 +27,8 @@ _IMAGE_MIMES = {
 
 _DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 
+_PDF_MIME = "application/pdf"
+
 
 async def list_folder_images(folder_id: str) -> list[dict]:
     """List all image files from a public Google Drive folder.
@@ -113,6 +115,112 @@ async def _list_with_api_key(folder_id: str) -> list[dict]:
     results.sort(key=lambda x: (x["sort_key"], x["name"]))
     logger.info(f"Listed {len(results)} images from Drive folder {folder_id}")
     return results
+
+
+async def list_folder_pdfs(folder_id: str) -> list[dict]:
+    """List all PDF files in a public Google Drive folder.
+
+    Returns a list of dicts: {file_id, name, size}.
+    """
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY not configured; cannot list PDFs from Drive.")
+
+    from whatsapp_messaging import _get_session
+
+    results = []
+    page_token = ""
+    query = f"'{folder_id}' in parents and mimeType='{_PDF_MIME}' and trashed=false"
+
+    try:
+        session = await _get_session()
+        while True:
+            params = {
+                "q": query,
+                "fields": "nextPageToken,files(id,name,size)",
+                "pageSize": "1000",
+                "orderBy": "name",
+                "key": GOOGLE_API_KEY,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+
+            async with session.get(_DRIVE_FILES_URL, params=params) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    if "notFound" in body or resp.status == 404:
+                        raise RuntimeError("Drive folder not found. Make it 'Anyone with the link'.")
+                    if "forbidden" in body.lower() or resp.status == 403:
+                        raise RuntimeError("Drive folder access denied. Make it 'Anyone with the link'.")
+                    raise RuntimeError(f"Drive API error ({resp.status}): {body[:200]}")
+                try:
+                    data = json.loads(body)
+                except (ValueError, TypeError):
+                    raise RuntimeError(f"Drive API returned non-JSON: {body[:200]}")
+
+            for f in data.get("files", []):
+                results.append({
+                    "file_id": f["id"],
+                    "name": f.get("name", ""),
+                    "size": int(f["size"]) if f.get("size") and str(f["size"]).isdigit() else 0,
+                })
+
+            page_token = data.get("nextPageToken", "")
+            if not page_token:
+                break
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Drive API error: {e}")
+
+    logger.info(f"Listed {len(results)} PDFs from Drive folder {folder_id}")
+    return results
+
+
+async def download_pdf(file_id: str, max_bytes: int = 100 * 1024 * 1024) -> bytes:
+    """Download a PDF from Google Drive by file_id.
+
+    Verifies the response Content-Type is application/pdf (refuses the
+    HTML virus-scan interstitial that Drive serves for very large files).
+    """
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY not configured")
+
+    from whatsapp_messaging import _get_session
+
+    url = f"{_DRIVE_FILES_URL}/{file_id}"
+    params = {"alt": "media", "key": GOOGLE_API_KEY}
+    headers = {"Accept": "application/pdf"}
+
+    last_err = ""
+    for attempt in range(3):
+        try:
+            session = await _get_session()
+            async with session.get(url, params=params, headers=headers) as resp:
+                ct = (resp.headers.get("Content-Type") or "").lower()
+                if resp.status == 200 and "application/pdf" in ct:
+                    data = await resp.read()
+                    if len(data) > max_bytes:
+                        raise RuntimeError(f"PDF too large ({len(data)} bytes > {max_bytes})")
+                    if not data.startswith(b"%PDF-"):
+                        raise RuntimeError("Downloaded bytes are not a valid PDF (missing %PDF- header)")
+                    return data
+                body = await resp.text()
+                last_err = f"{resp.status} {ct or 'no-ct'}: {body[:200]}"
+                if resp.status in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                # Not retryable
+                break
+        except asyncio.TimeoutError:
+            last_err = "timeout"
+            await asyncio.sleep(2 ** attempt)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_err = str(e)
+            await asyncio.sleep(2 ** attempt)
+
+    raise RuntimeError(f"Drive download failed for {file_id}: {last_err}")
 
 
 def _list_with_service_account(folder_id: str) -> list[dict]:

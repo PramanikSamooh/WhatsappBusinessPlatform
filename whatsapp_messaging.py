@@ -27,6 +27,10 @@ WHATSAPP_API_URL = (
     f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 )
 
+# Meta error codes that indicate the recipient is not on WhatsApp (or otherwise
+# undeliverable to this number) — the fallback chain should advance on these.
+NOT_ON_WHATSAPP_CODES = {131026, 131047, 131051, 470, 131045}
+
 # Shared aiohttp session — reuses TCP connections instead of creating new ones per request.
 # At 50k msgs/day this prevents socket exhaustion and TCP handshake overhead.
 _shared_session: aiohttp.ClientSession | None = None
@@ -288,7 +292,7 @@ async def send_whatsapp_template(
                 else:
                     body = await resp.text()
                     logger.warning(f"Template send failed {resp.status}: {body}")
-                    return {"success": False, "error": body[:200]}
+                    return {"success": False, "error": body[:300], "code": extract_error_code(body)}
     except Exception as e:
         logger.error(f"Failed to send template to {to_phone}: {e}")
         return {"success": False, "error": str(e)[:200]}
@@ -368,9 +372,83 @@ async def send_marketing_template(
                 else:
                     body = await resp.text()
                     logger.warning(f"Marketing template send failed {resp.status}: {body}")
-                    return {"success": False, "error": body[:200]}
+                    return {"success": False, "error": body[:300], "code": extract_error_code(body)}
     except Exception as e:
         logger.error(f"Failed to send marketing template to {to_phone}: {e}")
+        return {"success": False, "error": str(e)[:200]}
+
+
+def extract_error_code(resp_body) -> int | None:
+    """Parse a Meta error response and return the numeric code, or None.
+
+    Accepts either a parsed dict or a raw string. Handles both top-level
+    `error.code` and the nested `error.error_data.messaging_product` shape.
+    """
+    if not resp_body:
+        return None
+    data = resp_body
+    if isinstance(resp_body, str):
+        try:
+            data = json.loads(resp_body)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error") or {}
+    code = err.get("code")
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str) and code.isdigit():
+        return int(code)
+    return None
+
+
+async def upload_media_pdf(file_bytes: bytes, filename: str) -> dict:
+    """Upload a PDF to WhatsApp Cloud API /media and return a media_id.
+
+    The returned media_id is reusable for ~30 days and can be referenced
+    in template document headers as {"document": {"id": media_id, "filename": ...}}.
+
+    Args:
+        file_bytes: PDF binary content.
+        filename: Original filename (passed to Meta and shown to the recipient).
+
+    Returns:
+        {"success": True, "media_id": "..."} on success,
+        {"success": False, "error": "..."} on failure.
+    """
+    if not all([WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID]):
+        return {"success": False, "error": "WhatsApp credentials not configured"}
+
+    if not file_bytes:
+        return {"success": False, "error": "Empty file"}
+
+    upload_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+
+    form = aiohttp.FormData()
+    form.add_field("messaging_product", "whatsapp")
+    form.add_field("type", "application/pdf")
+    form.add_field("file", file_bytes, filename=filename, content_type="application/pdf")
+
+    try:
+        session = await _get_session()
+        async with session.post(upload_url, data=form, headers=headers) as resp:
+            body_text = await resp.text()
+            if resp.status == 200:
+                try:
+                    data = json.loads(body_text)
+                except (ValueError, TypeError):
+                    return {"success": False, "error": f"Invalid JSON response: {body_text[:200]}"}
+                media_id = data.get("id", "")
+                if not media_id:
+                    return {"success": False, "error": f"No media id in response: {body_text[:200]}"}
+                logger.info(f"Uploaded PDF '{filename}' ({len(file_bytes)} bytes) -> media_id={media_id}")
+                return {"success": True, "media_id": media_id}
+            logger.warning(f"PDF upload failed {resp.status}: {body_text[:200]}")
+            return {"success": False, "error": body_text[:300], "code": extract_error_code(body_text)}
+    except Exception as e:
+        logger.error(f"PDF upload exception for '{filename}': {e}")
         return {"success": False, "error": str(e)[:200]}
 
 
