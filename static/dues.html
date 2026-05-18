@@ -74,11 +74,17 @@
                             <p class="text-xs text-gray-400 mt-1">Folder must be "Anyone with the link can view". Leave blank to use server default.</p>
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">PDF Filename Pattern</label>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Drive filename pattern</label>
                             <input type="text" id="filenameTemplate" value="All Letters_{serial}.pdf"
                                 class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono">
-                            <p class="text-xs text-gray-400 mt-1">Use <code>{serial}</code> for the S.N. value. Example: <code>गुणायतन दान विवरण_{serial}.pdf</code>.</p>
+                            <p class="text-xs text-gray-400 mt-1">Must match the actual files in Drive. Use <code>{serial}</code> for the S.N.</p>
                         </div>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Filename shown to customer in WhatsApp (optional)</label>
+                        <input type="text" id="displayFilenameTemplate" placeholder="Leave blank to use the Drive filename above. Example: गुणायतन दान विवरण_{serial}.pdf"
+                            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono">
+                        <p class="text-xs text-gray-400 mt-1">You can use a Hindi/donor-friendly name here without renaming files in Drive. <code>{serial}</code> is optional — omit it to show the same name to every recipient.</p>
                     </div>
                     <div class="grid grid-cols-2 gap-4">
                         <div>
@@ -121,7 +127,8 @@
                                     <th class="py-2 px-2">S.N.</th>
                                     <th class="py-2 px-2">Name</th>
                                     <th class="py-2 px-2">Fallback chain</th>
-                                    <th class="py-2 px-2">PDF</th>
+                                    <th class="py-2 px-2">Drive PDF</th>
+                                    <th class="py-2 px-2">Shown as</th>
                                 </tr>
                             </thead>
                             <tbody id="previewRows"></tbody>
@@ -154,10 +161,20 @@
                 </div>
                 <div id="detailStats" class="grid grid-cols-5 gap-3 mb-3"></div>
                 <div id="stagingBox" class="hidden bg-gray-50 rounded-lg p-3 mb-3"></div>
-                <div id="detailFilename" class="hidden bg-gray-50 rounded-lg p-3 mb-3 text-sm">
-                    <span class="text-gray-500">Filename pattern:</span>
-                    <code id="detailFilenameValue" class="font-mono text-gray-800 mx-2">-</code>
-                    <button onclick="editFilename()" class="text-xs text-blue-600 hover:text-blue-800">Edit + re-stage</button>
+                <div id="detailFilename" class="hidden bg-gray-50 rounded-lg p-3 mb-3 text-sm space-y-1">
+                    <div>
+                        <span class="text-gray-500">Drive filename:</span>
+                        <code id="detailDriveFilename" class="font-mono text-gray-800 mx-2">-</code>
+                    </div>
+                    <div>
+                        <span class="text-gray-500">Shown to customer:</span>
+                        <code id="detailDisplayFilename" class="font-mono text-gray-800 mx-2">-</code>
+                    </div>
+                    <div>
+                        <button onclick="editFilename('display')" class="text-xs text-blue-600 hover:text-blue-800">Edit customer-facing name + re-stage</button>
+                        <span class="text-gray-300 mx-2">|</span>
+                        <button onclick="editFilename('drive')" class="text-xs text-blue-600 hover:text-blue-800">Edit Drive filename + re-stage</button>
+                    </div>
                 </div>
                 <div id="detailActions" class="flex gap-2 mb-3"></div>
                 <div class="overflow-x-auto max-h-[600px] overflow-y-auto">
@@ -376,6 +393,7 @@ async function doUpload(event) {
     formData.append('file', fileInput.files[0]);
     formData.append('drive_folder_id', document.getElementById('driveFolderId').value);
     formData.append('filename_template', document.getElementById('filenameTemplate').value);
+    formData.append('display_filename_template', document.getElementById('displayFilenameTemplate').value);
     formData.append('template_name', selectedTemplate.name);
     formData.append('language', selectedTemplate.language);
     formData.append('campaign_name', document.getElementById('campaignName').value);
@@ -397,7 +415,8 @@ async function doUpload(event) {
                     <td class="py-1 px-2 font-mono">${esc(p.extra_data?.serial||'')}</td>
                     <td class="py-1 px-2">${esc(p.name||'')}</td>
                     <td class="py-1 px-2 font-mono">${(p.extra_data?.fallback_chain||[]).map(esc).join(' → ')}</td>
-                    <td class="py-1 px-2 font-mono text-gray-500">${esc(p.extra_data?.pdf_filename||'')}</td>
+                    <td class="py-1 px-2 font-mono text-gray-500">${esc(p.extra_data?.pdf_drive_filename||p.extra_data?.pdf_filename||'')}</td>
+                    <td class="py-1 px-2 font-mono text-gray-700">${esc(p.extra_data?.pdf_filename||'')}</td>
                 </tr>`).join('');
             preview.classList.remove('hidden');
             loadCampaigns();
@@ -503,9 +522,11 @@ async function refreshCampaignDetail(id) {
         const resp = await api(`/api/dues/campaigns/${id}`);
         const c = await resp.json();
         document.getElementById('detailTitle').textContent = c.name || 'Campaign';
-        const filename = c.pdf_filename_template || '';
-        if (filename) {
-            document.getElementById('detailFilenameValue').textContent = filename;
+        const driveName = c.pdf_filename_template || '';
+        const displayName = c.pdf_display_filename_template || '';
+        if (driveName || displayName) {
+            document.getElementById('detailDriveFilename').textContent = driveName || '-';
+            document.getElementById('detailDisplayFilename').textContent = displayName || `(same as Drive — '${driveName}')`;
             document.getElementById('detailFilename').classList.remove('hidden');
         } else {
             document.getElementById('detailFilename').classList.add('hidden');
@@ -582,20 +603,29 @@ async function kickStage(id) {
     catch(e) { alert('Stage start failed: '+e.message); }
 }
 
-async function editFilename() {
+async function editFilename(kind) {
     if (!activeCampaignId) return;
-    const current = document.getElementById('detailFilenameValue').textContent || '';
-    const next = prompt(
-        'New filename pattern (must include {serial}). All staged PDFs will be re-uploaded so WhatsApp shows the new name.',
-        current
-    );
-    if (!next || next === current) return;
-    if (next.indexOf('{serial}') === -1) { alert('Pattern must include {serial}'); return; }
+    const isDisplay = kind === 'display';
+    const currentEl = isDisplay
+        ? document.getElementById('detailDisplayFilename')
+        : document.getElementById('detailDriveFilename');
+    let current = currentEl.textContent || '';
+    if (current.startsWith('(same as Drive')) current = '';
+    const promptMsg = isDisplay
+        ? 'Customer-facing filename pattern. Shown in the WhatsApp doc box. {serial} is optional. Example: गुणायतन दान विवरण_{serial}.pdf'
+        : 'Drive filename pattern. Must match real files in your Drive folder. {serial} is required. Example: All Letters_{serial}.pdf';
+    const next = prompt(promptMsg, current);
+    if (next === null) return; // user cancelled
+    if (next === current) return;
+    if (!isDisplay && next && next.indexOf('{serial}') === -1) { alert('Drive pattern must include {serial}'); return; }
     if (!confirm('This clears the current media_id on all recipients. You will need to click "Stage media" again. Continue?')) return;
+    const body = {reset_staging: true};
+    if (isDisplay) body.display_filename_template = next;
+    else body.filename_template = next;
     try {
         const resp = await api(`/api/dues/campaigns/${activeCampaignId}/filename`, {
             method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({filename_template: next, reset_staging: true}),
+            body: JSON.stringify(body),
         });
         if (!resp.ok) { const d = await resp.json().catch(()=>({})); alert(d.detail||'Rename failed'); return; }
         refreshCampaignDetail(activeCampaignId);

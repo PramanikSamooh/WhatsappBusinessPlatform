@@ -2639,6 +2639,11 @@ async def dues_upload(request: Request):
             detail="Filename pattern must contain '{serial}' (e.g. 'All Letters_{serial}.pdf').",
         )
 
+    # Optional display name shown to the recipient on WhatsApp. Can be blank
+    # (then matches the Drive filename), and may omit {serial} if you want the
+    # same display name for everyone (e.g., 'गुणायतन दान विवरण.pdf').
+    display_filename_template = str(form.get("display_filename_template") or "").strip()
+
     # Variable mapping: form value `var_mapping` is a JSON object like
     #   {"1": "Name", "2": "City"}
     # mapping each {{N}} placeholder in the template body to an Excel column header.
@@ -2774,7 +2779,12 @@ async def dues_upload(request: Request):
                 skipped_no_numbers += 1
                 continue
 
-            pdf_filename = filename_template.format(serial=serial)
+            pdf_drive_filename = filename_template.format(serial=serial)
+            pdf_filename = (
+                display_filename_template.format(serial=serial)
+                if display_filename_template
+                else pdf_drive_filename
+            )
 
             # Resolve template body variables {{1}}, {{2}}, ... from the mapping.
             row_template_params: list[str] = []
@@ -2799,6 +2809,7 @@ async def dues_upload(request: Request):
                 "fallback_chain": chain,
                 "fallback_index": 0,
                 "pdf_filename": pdf_filename,
+                "pdf_drive_filename": pdf_drive_filename,
                 "staging_status": "pending",
             }
             if row_template_params:
@@ -2838,6 +2849,7 @@ async def dues_upload(request: Request):
             campaign_id,
             header_image_url=drive_folder_id,
             pdf_filename_template=filename_template,
+            pdf_display_filename_template=display_filename_template,
         )
     else:
         campaign = await create_campaign(
@@ -2855,6 +2867,7 @@ async def dues_upload(request: Request):
             campaign_id,
             header_image_url=drive_folder_id,
             pdf_filename_template=filename_template,
+            pdf_display_filename_template=display_filename_template,
         )
 
     result = await upsert_dues_recipients(campaign_id, records)
@@ -2868,6 +2881,7 @@ async def dues_upload(request: Request):
         "language": language,
         "drive_folder_id": drive_folder_id,
         "filename_template": filename_template,
+        "display_filename_template": display_filename_template,
         "var_mapping": {str(k): v for k, v in var_mapping.items()},
         "skipped_no_numbers": skipped_no_numbers,
         "preview": records[:5],
@@ -2943,14 +2957,33 @@ async def dues_update_filename(campaign_id: str, request: Request):
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
-    new_pattern = str(body.get("filename_template") or "").strip()
-    if "{serial}" not in new_pattern:
-        raise HTTPException(status_code=400, detail="Pattern must contain '{serial}'.")
+
+    new_drive_pattern = body.get("filename_template")
+    new_display_pattern = body.get("display_filename_template")
+    if new_drive_pattern is not None:
+        new_drive_pattern = str(new_drive_pattern).strip()
+        if new_drive_pattern and "{serial}" not in new_drive_pattern:
+            raise HTTPException(status_code=400, detail="Drive filename pattern must contain '{serial}'.")
+    if new_display_pattern is not None:
+        new_display_pattern = str(new_display_pattern).strip()
+        # Display pattern may omit {serial} (same name for every recipient).
+    if new_drive_pattern is None and new_display_pattern is None:
+        raise HTTPException(status_code=400, detail="Provide filename_template and/or display_filename_template.")
     reset_staging = bool(body.get("reset_staging", True))
 
-    await update_campaign(campaign_id, pdf_filename_template=new_pattern)
+    # Determine effective values (use existing if not being updated).
+    effective_drive = new_drive_pattern if new_drive_pattern is not None else (campaign.get("pdf_filename_template") or "")
+    effective_display = new_display_pattern if new_display_pattern is not None else (campaign.get("pdf_display_filename_template") or "")
 
-    # Refresh the pre-computed pdf_filename in each recipient's extra_data so
+    campaign_updates = {}
+    if new_drive_pattern is not None:
+        campaign_updates["pdf_filename_template"] = new_drive_pattern
+    if new_display_pattern is not None:
+        campaign_updates["pdf_display_filename_template"] = new_display_pattern
+    if campaign_updates:
+        await update_campaign(campaign_id, **campaign_updates)
+
+    # Refresh the pre-computed filenames in each recipient's extra_data so
     # the audit/export shows the right name even before re-staging completes.
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -2965,7 +2998,11 @@ async def dues_update_filename(campaign_id: str, request: Request):
             except (ValueError, TypeError):
                 extra = {}
             serial = extra.get("serial") or ""
-            extra["pdf_filename"] = new_pattern.format(serial=serial) if serial else extra.get("pdf_filename", "")
+            if effective_drive:
+                extra["pdf_drive_filename"] = effective_drive.format(serial=serial) if serial else extra.get("pdf_drive_filename", effective_drive)
+            display_src = effective_display or effective_drive
+            if display_src:
+                extra["pdf_filename"] = display_src.format(serial=serial) if serial else display_src
             if reset_staging:
                 extra["staging_status"] = "pending"
                 extra["staging_error"] = ""
@@ -2980,7 +3017,8 @@ async def dues_update_filename(campaign_id: str, request: Request):
     return {
         "status": "updated",
         "campaign_id": campaign_id,
-        "filename_template": new_pattern,
+        "filename_template": effective_drive,
+        "display_filename_template": effective_display,
         "reset_staging": reset_staging,
         "recipients": len(rows),
     }
@@ -2999,7 +3037,12 @@ async def dues_stage_media(campaign_id: str):
     if not drive_folder_id:
         raise HTTPException(status_code=400, detail="No Drive folder ID configured for this campaign")
     filename_template = (campaign.get("pdf_filename_template") or DUES_PDF_FILENAME_TEMPLATE or "").strip()
-    media_staging.start_staging(campaign_id, drive_folder_id, filename_template=filename_template)
+    display_filename_template = (campaign.get("pdf_display_filename_template") or "").strip()
+    media_staging.start_staging(
+        campaign_id, drive_folder_id,
+        filename_template=filename_template,
+        display_filename_template=display_filename_template or None,
+    )
     return {"status": "starting", "campaign_id": campaign_id}
 
 

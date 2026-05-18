@@ -66,6 +66,15 @@ async def init_campaign_tables():
             await db.commit()
         except Exception:
             pass  # Column already exists
+        # Migration: add pdf_display_filename_template — the filename WhatsApp
+        # shows to the recipient. Decoupled from the Drive-lookup filename so
+        # donor-facing names can be friendly (e.g., Hindi) without renaming
+        # the files in Drive.
+        try:
+            await db.execute("ALTER TABLE campaigns ADD COLUMN pdf_display_filename_template TEXT DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
         await db.execute("""
             CREATE TABLE IF NOT EXISTS campaign_recipients (
                 id              TEXT PRIMARY KEY,
@@ -179,7 +188,7 @@ _CAMPAIGN_ALLOWED_COLUMNS = {
     "name", "template_name", "template_category", "language", "template_params", "status",
     "recipient_count", "sent_count", "delivered_count", "read_count",
     "failed_count", "rate_limit_per_min", "started_at", "completed_at", "source",
-    "header_image_url", "pdf_filename_template",
+    "header_image_url", "pdf_filename_template", "pdf_display_filename_template",
 }
 
 

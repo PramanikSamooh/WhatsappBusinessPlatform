@@ -61,13 +61,24 @@ def cancel_staging(campaign_id: str) -> bool:
     return False
 
 
-def start_staging(campaign_id: str, drive_folder_id: str, filename_template: str | None = None) -> bool:
-    """Start a background staging task for a campaign. Returns False if one is already running."""
+def start_staging(
+    campaign_id: str,
+    drive_folder_id: str,
+    filename_template: str | None = None,
+    display_filename_template: str | None = None,
+) -> bool:
+    """Start a background staging task for a campaign. Returns False if one is already running.
+
+    `filename_template` is the pattern used to find the file in the Drive folder
+    (must match the actual file names). `display_filename_template` is what
+    WhatsApp shows to the recipient — falls back to `filename_template` if blank.
+    """
     if is_staging(campaign_id):
         return False
-    template = filename_template or os.getenv("DUES_PDF_FILENAME_TEMPLATE", "All Letters_{serial}.pdf")
+    drive_tpl = filename_template or os.getenv("DUES_PDF_FILENAME_TEMPLATE", "All Letters_{serial}.pdf")
+    display_tpl = display_filename_template or drive_tpl
     task = asyncio.create_task(
-        _stage_campaign_media(campaign_id, drive_folder_id, template, DUES_STAGING_RPS)
+        _stage_campaign_media(campaign_id, drive_folder_id, drive_tpl, display_tpl, DUES_STAGING_RPS)
     )
     _running_stagers[campaign_id] = task
     return True
@@ -77,6 +88,7 @@ async def _stage_campaign_media(
     campaign_id: str,
     drive_folder_id: str,
     filename_template: str,
+    display_filename_template: str,
     rps: float,
 ) -> None:
     """Stage all unstaged/expired recipients for a campaign."""
@@ -96,7 +108,7 @@ async def _stage_campaign_media(
         interval = 1.0 / max(rps, 0.1)
         for recipient in recipients:
             try:
-                await _stage_one(recipient, filename_template, name_to_file)
+                await _stage_one(recipient, filename_template, display_filename_template, name_to_file)
                 # Refresh progress from DB after each row so the UI reflects state
                 snapshot = await get_staging_progress(campaign_id)
                 _progress[campaign_id].update({
@@ -145,9 +157,11 @@ async def _stage_campaign_media(
 async def _stage_one(
     recipient: dict,
     filename_template: str,
+    display_filename_template: str,
     name_to_file: dict[str, str],
 ) -> None:
-    """Stage one recipient: find PDF, download, upload, persist media_id."""
+    """Stage one recipient: find PDF in Drive (by drive-side name), download,
+    upload to WhatsApp with the display name, persist media_id."""
     rid = recipient["id"]
     try:
         extra = json.loads(recipient.get("extra_data") or "{}")
@@ -158,29 +172,31 @@ async def _stage_one(
         await update_recipient_extra(rid, staging_status="error", staging_error="missing serial in extra_data")
         return
 
-    expected = filename_template.format(serial=serial).strip()
-    file_id = name_to_file.get(_norm_name(expected))
-    if not file_id:
-        # Try with .pdf appended if template didn't include it
-        if "." not in expected:
-            file_id = name_to_file.get(_norm_name(expected + ".pdf"))
+    drive_name = filename_template.format(serial=serial).strip()
+    display_name = (display_filename_template or filename_template).format(serial=serial).strip()
+    file_id = name_to_file.get(_norm_name(drive_name))
+    if not file_id and "." not in drive_name:
+        # Tolerate templates that omitted the extension
+        file_id = name_to_file.get(_norm_name(drive_name + ".pdf"))
     if not file_id:
         await update_recipient_extra(
             rid,
             staging_status="missing",
-            staging_error=f"PDF '{expected}' not found in Drive folder",
-            pdf_filename=expected,
+            staging_error=f"PDF '{drive_name}' not found in Drive folder",
+            pdf_filename=display_name,
+            pdf_drive_filename=drive_name,
         )
         return
 
     pdf_bytes = await download_pdf(file_id)
-    upload_result = await upload_media_pdf(pdf_bytes, expected)
+    upload_result = await upload_media_pdf(pdf_bytes, display_name)
     if not upload_result.get("success"):
         await update_recipient_extra(
             rid,
             staging_status="error",
             staging_error=f"WhatsApp upload failed: {upload_result.get('error', '')[:200]}",
-            pdf_filename=expected,
+            pdf_filename=display_name,
+            pdf_drive_filename=drive_name,
         )
         return
 
@@ -191,17 +207,24 @@ async def _stage_one(
         staging_error="",
         media_id=upload_result["media_id"],
         media_expires_at=expires_at,
-        pdf_filename=expected,
+        pdf_filename=display_name,
+        pdf_drive_filename=drive_name,
     )
 
 
-async def restage_one(recipient_id: str, drive_folder_id: str, filename_template: str | None = None) -> dict:
+async def restage_one(
+    recipient_id: str,
+    drive_folder_id: str,
+    filename_template: str | None = None,
+    display_filename_template: str | None = None,
+) -> dict:
     """Re-stage a single recipient on demand (e.g., media_id expired).
 
     Returns the upload result dict {success, media_id|error}. Persists the new
     media_id to extra_data on success.
     """
-    template = filename_template or os.getenv("DUES_PDF_FILENAME_TEMPLATE", "All Letters_{serial}.pdf")
+    drive_tpl = filename_template or os.getenv("DUES_PDF_FILENAME_TEMPLATE", "All Letters_{serial}.pdf")
+    display_tpl = display_filename_template or drive_tpl
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -215,7 +238,7 @@ async def restage_one(recipient_id: str, drive_folder_id: str, filename_template
 
     files = await list_folder_pdfs(drive_folder_id)
     name_to_file = {_norm_name(f["name"]): f["file_id"] for f in files}
-    await _stage_one(recipient, template, name_to_file)
+    await _stage_one(recipient, drive_tpl, display_tpl, name_to_file)
     # Re-read to confirm
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
