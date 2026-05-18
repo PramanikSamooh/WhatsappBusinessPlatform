@@ -14,6 +14,7 @@ and posts call/chat summaries back to n8n for automation.
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -76,13 +77,24 @@ from campaign_db import (
     export_campaign_results,
     get_campaign,
     get_recipient_stats,
+    get_staging_progress,
     list_campaigns,
     list_recipients,
     refresh_campaign_stats,
     update_campaign,
+    upsert_dues_recipients,
 )
-from campaign_runner import is_campaign_running, request_pause, run_campaign
-from db import complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
+from campaign_runner import (
+    is_campaign_running,
+    is_retry_worker_running,
+    request_pause,
+    run_campaign,
+    start_deferred_retry_worker,
+    stop_retry_worker,
+)
+import media_staging
+import aiosqlite
+from db import DB_PATH, complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
 from knowledge import KNOWLEDGE_DIR, invalidate_cache as invalidate_knowledge_cache, load_knowledge
 from message_router import is_global_ai_enabled, route_webhook, set_global_ai_enabled
 from orders import handle_razorpay_webhook
@@ -2384,6 +2396,759 @@ async def rooms_delete_campaign(campaign_id: str):
         raise HTTPException(status_code=404, detail="Campaign not found")
     if campaign.get("source") != "rooms":
         raise HTTPException(status_code=403, detail="Not a rooms campaign")
+    try:
+        deleted = await delete_campaign(campaign_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"status": "deleted", "campaign_id": campaign_id}
+
+
+# --- Dues (per-recipient PDF) campaign ---
+
+DUES_DRIVE_FOLDER_ID_DEFAULT = os.getenv("DUES_DRIVE_FOLDER_ID", "")
+DUES_PDF_FILENAME_TEMPLATE = os.getenv("DUES_PDF_FILENAME_TEMPLATE", "All Letters_{serial}.pdf")
+DUES_DEFAULT_TEMPLATE_NAME = os.getenv("DUES_TEMPLATE_NAME", "gunayatan_due_letter_hi")
+DUES_DEFAULT_LANGUAGE = os.getenv("DUES_TEMPLATE_LANG", "hi")
+DUES_TEMPLATE_CATEGORY = os.getenv("DUES_TEMPLATE_CATEGORY", "UTILITY")
+
+
+def _normalize_indian_phone(raw) -> str:
+    """Normalize a phone cell value to digits-only E.164 (no +).
+
+    - Accepts int/float/str
+    - Strips +, spaces, dashes, parentheses, periods
+    - If 10 digits starting with 6-9, prepends '91'
+    - If 12 digits starting with '91' → keep as-is
+    - Anything else → return '' (invalid)
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, float):
+        # Excel commonly stores numbers as floats; drop trailing .0
+        if raw == int(raw):
+            s = str(int(raw))
+        else:
+            s = repr(raw)
+    elif isinstance(raw, int):
+        s = str(raw)
+    else:
+        s = str(raw).strip()
+    # Remove common separators
+    s = re.sub(r"[\s\-\(\)\.\+]", "", s)
+    if not s.isdigit():
+        return ""
+    if len(s) == 10 and s[0] in "6789":
+        return "91" + s
+    if len(s) == 12 and s.startswith("91") and s[2] in "6789":
+        return s
+    if len(s) == 13 and s.startswith("091"):
+        return s[1:]
+    return ""
+
+
+@app.get("/dues")
+async def dues_page():
+    """Serve the dues PDF campaign staff page."""
+    p = STATIC_DIR / "dues.html"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Dues page not found")
+    return FileResponse(str(p), media_type="text/html")
+
+
+def _count_template_vars(components: list | None) -> int:
+    """Return the count of distinct {{N}} placeholders in the BODY component.
+
+    Header media variables don't count — those are the PDF media_id, handled
+    separately. We only need to map BODY {{1}}, {{2}}, ... to Excel columns.
+    """
+    if not components:
+        return 0
+    nums = set()
+    for comp in components:
+        if (comp.get("type") or "").upper() != "BODY":
+            continue
+        text = comp.get("text") or ""
+        for m in re.finditer(r"\{\{(\d+)\}\}", text):
+            try:
+                nums.add(int(m.group(1)))
+            except ValueError:
+                pass
+        # Some templates put parameters in example.body_text instead
+        ex = comp.get("example") or {}
+        bt = ex.get("body_text") or []
+        if bt and isinstance(bt, list) and bt and isinstance(bt[0], list):
+            nums.update(range(1, len(bt[0]) + 1))
+    return max(nums) if nums else 0
+
+
+def _template_header_type(components: list | None) -> str:
+    """Return the header format ('DOCUMENT', 'IMAGE', 'TEXT', ...) or '' if none."""
+    if not components:
+        return ""
+    for comp in components:
+        if (comp.get("type") or "").upper() == "HEADER":
+            return (comp.get("format") or "").upper()
+    return ""
+
+
+@app.get("/api/dues/templates", dependencies=[Depends(require_rooms_auth)])
+async def dues_list_templates():
+    """List approved WhatsApp templates available for dues campaigns.
+
+    Returns name/language/category + variable count + header format so the UI
+    can drive the variable-mapping section.
+    """
+    templates = await get_whatsapp_templates()
+    out = []
+    for t in templates:
+        status = (t.get("status") or "").upper()
+        if status != "APPROVED":
+            continue
+        components = t.get("components") or []
+        out.append({
+            "name": t.get("name", ""),
+            "language": t.get("language", ""),
+            "category": t.get("category", ""),
+            "header_format": _template_header_type(components),
+            "body_var_count": _count_template_vars(components),
+        })
+    # Sort: dues-looking ones first, then alphabetical
+    def _key(t):
+        return (0 if "due" in t["name"].lower() else 1, t["name"])
+    out.sort(key=_key)
+    return {"templates": out, "count": len(out)}
+
+
+def _scan_excel_headers(content_bytes: bytes) -> dict:
+    """Open an xlsx in memory and locate the header row + extract columns.
+
+    Returns {header_row_idx, headers (list, ordered), sample (list of dicts)}.
+    Raises HTTPException on failure.
+    """
+    import io
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl not installed on server")
+    try:
+        wb = load_workbook(io.BytesIO(content_bytes), read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read Excel file: {e}")
+
+    header_row_idx = -1
+    header_values: list = []
+    for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True)):
+        if not row:
+            continue
+        lowered = [str(v).strip().lower() if v is not None else "" for v in row]
+        if "name" in lowered and any(("phone" in v) or ("mob" in v) or ("whatsapp" in v) or ("whats app" in v) for v in lowered):
+            header_row_idx = r_idx + 1
+            header_values = list(row)
+            break
+    if header_row_idx < 0:
+        wb.close()
+        raise HTTPException(status_code=400, detail="Could not find a header row with 'Name' and a phone column in the first 5 rows.")
+
+    headers = [str(v).strip() if v is not None else "" for v in header_values]
+    headers = [h for h in headers if h]
+
+    sample_rows = []
+    for row in ws.iter_rows(min_row=header_row_idx + 1, max_row=header_row_idx + 5, values_only=True):
+        if not row:
+            continue
+        rec = {}
+        for idx, h in enumerate(headers):
+            if idx < len(row) and row[idx] is not None:
+                v = row[idx]
+                if isinstance(v, float) and v == int(v):
+                    v = int(v)
+                rec[h] = str(v)
+            else:
+                rec[h] = ""
+        sample_rows.append(rec)
+    wb.close()
+    return {"header_row_idx": header_row_idx, "headers": headers, "sample": sample_rows}
+
+
+@app.post("/api/dues/probe", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_probe(request: Request):
+    """Read uploaded Excel headers + return columns and a 5-row sample.
+
+    Lets the frontend show variable-mapping dropdowns BEFORE the user commits
+    to creating a campaign.
+    """
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read form: {e}")
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    filename = getattr(file, "filename", "")
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are accepted")
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 20 MB)")
+    return _scan_excel_headers(content)
+
+
+@app.post("/api/dues/upload", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_upload(request: Request):
+    """Upload Excel for a dues PDF campaign.
+
+    Expected Excel columns (case-insensitive, row 2 headers):
+      S.N. / S No / Serial, Name, City (optional), Phone Number,
+      Alternate Number, Whats App Number
+    """
+    import io
+    import traceback
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl not installed on server")
+
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read form: {e}")
+
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    filename = getattr(file, "filename", "")
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are accepted")
+
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 20 MB)")
+
+    drive_folder_id = str(form.get("drive_folder_id") or DUES_DRIVE_FOLDER_ID_DEFAULT or "").strip()
+    if not drive_folder_id:
+        raise HTTPException(status_code=400, detail="Google Drive folder ID is required")
+
+    filename_template = str(form.get("filename_template") or DUES_PDF_FILENAME_TEMPLATE or "").strip()
+    if "{serial}" not in filename_template:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename pattern must contain '{serial}' (e.g. 'All Letters_{serial}.pdf').",
+        )
+
+    # Optional display name shown to the recipient on WhatsApp. Can be blank
+    # (then matches the Drive filename), and may omit {serial} if you want the
+    # same display name for everyone (e.g., 'गुणायतन दान विवरण.pdf').
+    display_filename_template = str(form.get("display_filename_template") or "").strip()
+
+    # Variable mapping: form value `var_mapping` is a JSON object like
+    #   {"1": "Name", "2": "City"}
+    # mapping each {{N}} placeholder in the template body to an Excel column header.
+    var_mapping_raw = str(form.get("var_mapping") or "").strip()
+    var_mapping: dict[int, str] = {}
+    if var_mapping_raw:
+        try:
+            parsed = json.loads(var_mapping_raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("var_mapping must be a JSON object")
+            for k, v in parsed.items():
+                try:
+                    idx = int(k)
+                except (TypeError, ValueError):
+                    raise ValueError(f"var_mapping key '{k}' must be an integer")
+                if not isinstance(v, str) or not v.strip():
+                    raise ValueError(f"var_mapping value for '{k}' must be a non-empty string")
+                var_mapping[idx] = v.strip()
+        except (ValueError, TypeError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid var_mapping JSON: {e}")
+
+    try:
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read Excel file: {e}")
+
+    try:
+        # The header row isn't always row 1 (this file has a title in row 1).
+        # Scan the first 5 rows for one that contains 'name' AND a phone-ish column.
+        header_row_idx = -1
+        header_values: list = []
+        for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True)):
+            if not row:
+                continue
+            lowered = [str(v).strip().lower() if v is not None else "" for v in row]
+            if "name" in lowered and any(("phone" in v) or ("mob" in v) or ("whatsapp" in v) or ("whats app" in v) for v in lowered):
+                header_row_idx = r_idx + 1  # openpyxl is 1-based
+                header_values = list(row)
+                break
+        if header_row_idx < 0:
+            wb.close()
+            raise HTTPException(status_code=400, detail="Could not find a header row with 'Name' and a phone column in the first 5 rows.")
+
+        headers = {}
+        for idx, val in enumerate(header_values):
+            if val is not None:
+                headers[str(val).strip().lower()] = idx
+
+        def find_col(*names):
+            for n in names:
+                if n in headers:
+                    return headers[n]
+            # also try contains-match (e.g., "phone number  " with trailing space)
+            for h, idx in headers.items():
+                for n in names:
+                    if n in h:
+                        return idx
+            return None
+
+        col_serial = find_col("s.n.", "s.n", "sn", "s no", "s. no", "serial", "sr no", "sr. no", "sno")
+        col_name = find_col("name", "naam")
+        col_city = find_col("city", "shahar")
+        col_phone = find_col("phone number", "phone", "mobile", "mob")
+        col_wa = find_col("whats app number", "whatsapp number", "whatsapp", "whats app", "wa number", "wa")
+        col_alt = find_col("alternate number", "alternate", "alt number", "alt")
+
+        if col_serial is None or col_name is None:
+            wb.close()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Excel must have 'S.N.' (or Serial) and 'Name' columns. Found headers: {list(headers.keys())}",
+            )
+
+        # Resolve each var_mapping value (a column header) to a column index.
+        # Build header→idx lookup that preserves the original casing of headers.
+        headers_orig = {}
+        for idx, val in enumerate(header_values):
+            if val is not None:
+                headers_orig[str(val).strip()] = idx
+        var_col_idx: dict[int, int] = {}
+        for v_num, col_header in var_mapping.items():
+            if col_header in headers_orig:
+                var_col_idx[v_num] = headers_orig[col_header]
+            elif col_header.lower() in headers:
+                var_col_idx[v_num] = headers[col_header.lower()]
+            else:
+                wb.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Variable {{{{{v_num}}}}} mapped to unknown column '{col_header}'. Available: {list(headers_orig.keys())}",
+                )
+
+        records = []
+        skipped_no_numbers = 0
+        for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+            if not row:
+                continue
+
+            def cell(idx):
+                if idx is None or idx >= len(row) or row[idx] is None:
+                    return ""
+                v = row[idx]
+                if isinstance(v, (int, float)):
+                    return str(int(v)) if v == int(v) else str(v)
+                return str(v).strip()
+
+            serial_raw = cell(col_serial)
+            if not serial_raw:
+                continue
+            # Coerce serial to integer-like string (drop trailing .0)
+            try:
+                serial = str(int(float(serial_raw)))
+            except (ValueError, TypeError):
+                serial = serial_raw
+
+            name_val = cell(col_name)
+            city = cell(col_city)
+            phone_raw = cell(col_phone)
+            wa_raw = cell(col_wa)
+            alt_raw = cell(col_alt)
+
+            phone_norm = _normalize_indian_phone(phone_raw)
+            wa_norm = _normalize_indian_phone(wa_raw)
+            alt_norm = _normalize_indian_phone(alt_raw)
+
+            # Build fallback chain: WhatsApp -> Phone -> Alternate, drop empties, dedup
+            chain = []
+            for n in (wa_norm, phone_norm, alt_norm):
+                if n and n not in chain:
+                    chain.append(n)
+            if not chain:
+                skipped_no_numbers += 1
+                continue
+
+            pdf_drive_filename = filename_template.format(serial=serial)
+            pdf_filename = (
+                display_filename_template.format(serial=serial)
+                if display_filename_template
+                else pdf_drive_filename
+            )
+
+            # Resolve template body variables {{1}}, {{2}}, ... from the mapping.
+            row_template_params: list[str] = []
+            if var_col_idx:
+                max_n = max(var_col_idx.keys())
+                for n in range(1, max_n + 1):
+                    if n in var_col_idx:
+                        row_template_params.append(cell(var_col_idx[n]) or "-")
+                    else:
+                        row_template_params.append("-")
+
+            extra_record = {
+                "serial": serial,
+                "name": name_val,
+                "city": city,
+                "wa_number": wa_norm,
+                "phone_number": phone_norm,
+                "alt_number": alt_norm,
+                "wa_raw": str(wa_raw),
+                "phone_raw": str(phone_raw),
+                "alt_raw": str(alt_raw),
+                "fallback_chain": chain,
+                "fallback_index": 0,
+                "pdf_filename": pdf_filename,
+                "pdf_drive_filename": pdf_drive_filename,
+                "staging_status": "pending",
+            }
+            if row_template_params:
+                extra_record["template_params"] = row_template_params
+
+            records.append({
+                "phone": chain[0],
+                "name": name_val,
+                "extra_data": extra_record,
+            })
+
+        wb.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Dues upload row parse error: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Error parsing Excel rows: {e}")
+
+    if not records:
+        raise HTTPException(status_code=400, detail="No valid rows found in Excel")
+
+    logger.info(f"Dues upload: parsed {len(records)} records ({skipped_no_numbers} skipped)")
+
+    template_name = str(form.get("template_name") or DUES_DEFAULT_TEMPLATE_NAME).strip()
+    language = str(form.get("language") or DUES_DEFAULT_LANGUAGE).strip() or "hi"
+    campaign_name = str(form.get("campaign_name") or "").strip() or f"Dues - {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')}"
+    rate_limit = int(form.get("rate_limit") or os.getenv("CAMPAIGN_RATE_LIMIT", "100"))
+
+    campaign_id_in = str(form.get("campaign_id") or "").strip()
+    if campaign_id_in:
+        existing = await get_campaign(campaign_id_in)
+        if not existing or existing.get("source") != "dues":
+            raise HTTPException(status_code=404, detail="Dues campaign not found")
+        campaign_id = campaign_id_in
+        # Allow the user to update folder/filename pattern on a re-upload
+        await update_campaign(
+            campaign_id,
+            header_image_url=drive_folder_id,
+            pdf_filename_template=filename_template,
+            pdf_display_filename_template=display_filename_template,
+        )
+    else:
+        campaign = await create_campaign(
+            name=campaign_name,
+            template_name=template_name,
+            language=language,
+            template_category=DUES_TEMPLATE_CATEGORY,
+            rate_limit_per_min=rate_limit,
+            source="dues",
+        )
+        campaign_id = campaign["id"]
+        # Persist the Drive folder id (reuse header_image_url column as a generic
+        # per-campaign opaque source pointer) and the filename pattern.
+        await update_campaign(
+            campaign_id,
+            header_image_url=drive_folder_id,
+            pdf_filename_template=filename_template,
+            pdf_display_filename_template=display_filename_template,
+        )
+
+    result = await upsert_dues_recipients(campaign_id, records)
+
+    return {
+        "status": "draft",
+        "campaign_id": campaign_id,
+        "campaign_name": campaign_name,
+        "recipients": result,
+        "template": template_name,
+        "language": language,
+        "drive_folder_id": drive_folder_id,
+        "filename_template": filename_template,
+        "display_filename_template": display_filename_template,
+        "var_mapping": {str(k): v for k, v in var_mapping.items()},
+        "skipped_no_numbers": skipped_no_numbers,
+        "preview": records[:5],
+    }
+
+
+@app.get("/api/dues/campaigns", dependencies=[Depends(require_rooms_auth)])
+async def dues_list_campaigns(limit: int = 50):
+    all_campaigns = await list_campaigns(limit=limit)
+    dues_campaigns = [c for c in all_campaigns if c.get("source") == "dues"]
+    for c in dues_campaigns:
+        stats = await get_recipient_stats(c["id"])
+        c["sent_count"] = stats.get("sent", 0)
+        c["delivered_count"] = stats.get("delivered", 0)
+        c["read_count"] = stats.get("read", 0)
+        c["failed_count"] = stats.get("failed", 0)
+        c["pending_count"] = stats.get("pending", 0)
+    return {"campaigns": dues_campaigns, "count": len(dues_campaigns)}
+
+
+@app.get("/api/dues/campaigns/{campaign_id}", dependencies=[Depends(require_rooms_auth)])
+async def dues_campaign_status(campaign_id: str, recipients_limit: int = 1500):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("source") != "dues":
+        raise HTTPException(status_code=403, detail="Not a dues campaign")
+    campaign["recipient_stats"] = await get_recipient_stats(campaign_id)
+    campaign["staging_progress"] = await get_staging_progress(campaign_id)
+    campaign["staging_running"] = media_staging.is_staging(campaign_id)
+    campaign["staging_runtime"] = media_staging.get_progress(campaign_id)
+    campaign["retry_worker_running"] = is_retry_worker_running(campaign_id)
+    raw_recipients = await list_recipients(campaign_id, limit=recipients_limit)
+    enriched = []
+    for r in raw_recipients:
+        try:
+            extra = json.loads(r.get("extra_data") or "{}")
+        except (ValueError, TypeError):
+            extra = {}
+        chain = extra.get("fallback_chain") or []
+        idx = extra.get("fallback_index") if isinstance(extra.get("fallback_index"), int) else 0
+        used = chain[idx] if 0 <= idx < len(chain) else r.get("phone", "")
+        enriched.append({
+            **r,
+            "serial": extra.get("serial", ""),
+            "wa_number": extra.get("wa_number", ""),
+            "phone_number": extra.get("phone_number", ""),
+            "alt_number": extra.get("alt_number", ""),
+            "used_number": used,
+            "fallback_chain": chain,
+            "fallback_index": idx,
+            "pdf_filename": extra.get("pdf_filename", ""),
+            "staging_status": extra.get("staging_status", "pending"),
+            "staging_error": extra.get("staging_error", ""),
+            "attempts": len(extra.get("attempted_numbers") or []),
+        })
+    campaign["recipients"] = enriched
+    return campaign
+
+
+@app.post("/api/dues/campaigns/{campaign_id}/filename", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_update_filename(campaign_id: str, request: Request):
+    """Update the PDF filename pattern on an existing campaign.
+
+    Optionally resets staging on all recipients so the next stage-media call
+    re-uploads each PDF to WhatsApp with the new filename (otherwise WhatsApp
+    keeps showing the old filename since it's baked into the media_id).
+    """
+    campaign = await get_campaign(campaign_id)
+    if not campaign or campaign.get("source") != "dues":
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    new_drive_pattern = body.get("filename_template")
+    new_display_pattern = body.get("display_filename_template")
+    if new_drive_pattern is not None:
+        new_drive_pattern = str(new_drive_pattern).strip()
+        if new_drive_pattern and "{serial}" not in new_drive_pattern:
+            raise HTTPException(status_code=400, detail="Drive filename pattern must contain '{serial}'.")
+    if new_display_pattern is not None:
+        new_display_pattern = str(new_display_pattern).strip()
+        # Display pattern may omit {serial} (same name for every recipient).
+    if new_drive_pattern is None and new_display_pattern is None:
+        raise HTTPException(status_code=400, detail="Provide filename_template and/or display_filename_template.")
+    reset_staging = bool(body.get("reset_staging", True))
+
+    # Determine effective values (use existing if not being updated).
+    effective_drive = new_drive_pattern if new_drive_pattern is not None else (campaign.get("pdf_filename_template") or "")
+    effective_display = new_display_pattern if new_display_pattern is not None else (campaign.get("pdf_display_filename_template") or "")
+
+    campaign_updates = {}
+    if new_drive_pattern is not None:
+        campaign_updates["pdf_filename_template"] = new_drive_pattern
+    if new_display_pattern is not None:
+        campaign_updates["pdf_display_filename_template"] = new_display_pattern
+    if campaign_updates:
+        await update_campaign(campaign_id, **campaign_updates)
+
+    # Refresh the pre-computed filenames in each recipient's extra_data so
+    # the audit/export shows the right name even before re-staging completes.
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, extra_data FROM campaign_recipients WHERE campaign_id = ?",
+            (campaign_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            try:
+                extra = json.loads(row["extra_data"] or "{}")
+            except (ValueError, TypeError):
+                extra = {}
+            serial = extra.get("serial") or ""
+            if effective_drive:
+                extra["pdf_drive_filename"] = effective_drive.format(serial=serial) if serial else extra.get("pdf_drive_filename", effective_drive)
+            display_src = effective_display or effective_drive
+            if display_src:
+                extra["pdf_filename"] = display_src.format(serial=serial) if serial else display_src
+            if reset_staging:
+                extra["staging_status"] = "pending"
+                extra["staging_error"] = ""
+                extra.pop("media_id", None)
+                extra.pop("media_expires_at", None)
+            await db.execute(
+                "UPDATE campaign_recipients SET extra_data = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), row["id"]),
+            )
+        await db.commit()
+
+    return {
+        "status": "updated",
+        "campaign_id": campaign_id,
+        "filename_template": effective_drive,
+        "display_filename_template": effective_display,
+        "reset_staging": reset_staging,
+        "recipients": len(rows),
+    }
+
+
+@app.post("/api/dues/campaigns/{campaign_id}/stage-media", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_stage_media(campaign_id: str):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("source") != "dues":
+        raise HTTPException(status_code=403, detail="Not a dues campaign")
+    if media_staging.is_staging(campaign_id):
+        raise HTTPException(status_code=409, detail="Staging already in progress")
+    drive_folder_id = (campaign.get("header_image_url") or DUES_DRIVE_FOLDER_ID_DEFAULT or "").strip()
+    if not drive_folder_id:
+        raise HTTPException(status_code=400, detail="No Drive folder ID configured for this campaign")
+    filename_template = (campaign.get("pdf_filename_template") or DUES_PDF_FILENAME_TEMPLATE or "").strip()
+    display_filename_template = (campaign.get("pdf_display_filename_template") or "").strip()
+    media_staging.start_staging(
+        campaign_id, drive_folder_id,
+        filename_template=filename_template,
+        display_filename_template=display_filename_template or None,
+    )
+    return {"status": "starting", "campaign_id": campaign_id}
+
+
+@app.get("/api/dues/campaigns/{campaign_id}/stage-status", dependencies=[Depends(require_rooms_auth)])
+async def dues_stage_status(campaign_id: str):
+    campaign = await get_campaign(campaign_id)
+    if not campaign or campaign.get("source") != "dues":
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    progress = await get_staging_progress(campaign_id)
+    runtime = media_staging.get_progress(campaign_id)
+    return {
+        "running": media_staging.is_staging(campaign_id),
+        "progress": progress,
+        "runtime": runtime,
+    }
+
+
+@app.post("/api/dues/campaigns/{campaign_id}/stage-cancel", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_stage_cancel(campaign_id: str):
+    cancelled = media_staging.cancel_staging(campaign_id)
+    return {"status": "cancelled" if cancelled else "not_running"}
+
+
+@app.post("/api/dues/campaigns/{campaign_id}/start", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_start_campaign(campaign_id: str, request: Request, background_tasks: BackgroundTasks):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("source") != "dues":
+        raise HTTPException(status_code=403, detail="Not a dues campaign")
+    if is_campaign_running(campaign_id):
+        raise HTTPException(status_code=400, detail="Campaign is already running")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    mode = (body.get("mode") or "pending").strip()  # 'pending' | 'force_all' (more modes in retry path)
+
+    stats = await get_recipient_stats(campaign_id)
+    if stats["total"] == 0:
+        raise HTTPException(status_code=400, detail="No recipients in campaign")
+
+    staging = await get_staging_progress(campaign_id)
+    if mode != "force_all" and staging["staged"] < staging["total"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Staging incomplete: {staging['staged']}/{staging['total']} PDFs staged. Use mode='force_all' to send anyway.",
+        )
+
+    if campaign["status"] not in ("draft", "paused"):
+        # If completed/failed, flip to paused so run_campaign can pick it up
+        await update_campaign(campaign_id, status="paused")
+
+    background_tasks.add_task(run_campaign, campaign_id)
+    # Spawn the deferred retry worker (idempotent)
+    background_tasks.add_task(start_deferred_retry_worker, campaign_id)
+    return {"status": "starting", "campaign_id": campaign_id}
+
+
+@app.post("/api/dues/campaigns/{campaign_id}/pause", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_pause_campaign(campaign_id: str):
+    campaign = await get_campaign(campaign_id)
+    if not campaign or campaign.get("source") != "dues":
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    request_pause(campaign_id)
+    stop_retry_worker(campaign_id)
+    return {"status": "pausing", "campaign_id": campaign_id}
+
+
+@app.get("/api/dues/campaigns/{campaign_id}/export", dependencies=[Depends(require_rooms_auth)])
+async def dues_export(campaign_id: str):
+    import csv
+    import io
+    campaign = await get_campaign(campaign_id)
+    if not campaign or campaign.get("source") != "dues":
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    rows = await export_campaign_results(campaign_id)
+    buf = io.StringIO()
+    fieldnames = [
+        "serial", "name", "wa_number", "phone_number", "alt_number",
+        "used_number", "current_phone", "status", "attempts",
+        "sent_at", "delivered_at", "read_at",
+        "error_message", "pdf_filename", "staging_status", "media_id",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k, "") for k in fieldnames})
+    csv_text = buf.getvalue()
+    filename = f"dues-{campaign_id}-{datetime.now().strftime('%Y%m%d-%H%M')}.csv"
+    return JSONResponse(
+        content={"csv": csv_text, "filename": filename, "rows": len(rows)},
+    )
+
+
+@app.delete("/api/dues/campaigns/{campaign_id}/delete", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_delete_campaign(campaign_id: str):
+    campaign = await get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("source") != "dues":
+        raise HTTPException(status_code=403, detail="Not a dues campaign")
+    media_staging.cancel_staging(campaign_id)
+    stop_retry_worker(campaign_id)
     try:
         deleted = await delete_campaign(campaign_id)
     except ValueError as e:
