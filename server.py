@@ -2492,6 +2492,13 @@ async def dues_upload(request: Request):
     if not drive_folder_id:
         raise HTTPException(status_code=400, detail="Google Drive folder ID is required")
 
+    filename_template = str(form.get("filename_template") or DUES_PDF_FILENAME_TEMPLATE or "").strip()
+    if "{serial}" not in filename_template:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename pattern must contain '{serial}' (e.g. 'All Letters_{serial}.pdf').",
+        )
+
     try:
         wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         ws = wb.active
@@ -2587,7 +2594,7 @@ async def dues_upload(request: Request):
                 skipped_no_numbers += 1
                 continue
 
-            pdf_filename = DUES_PDF_FILENAME_TEMPLATE.format(serial=serial)
+            pdf_filename = filename_template.format(serial=serial)
 
             records.append({
                 "phone": chain[0],
@@ -2632,6 +2639,12 @@ async def dues_upload(request: Request):
         if not existing or existing.get("source") != "dues":
             raise HTTPException(status_code=404, detail="Dues campaign not found")
         campaign_id = campaign_id_in
+        # Allow the user to update folder/filename pattern on a re-upload
+        await update_campaign(
+            campaign_id,
+            header_image_url=drive_folder_id,
+            pdf_filename_template=filename_template,
+        )
     else:
         campaign = await create_campaign(
             name=campaign_name,
@@ -2642,9 +2655,13 @@ async def dues_upload(request: Request):
             source="dues",
         )
         campaign_id = campaign["id"]
-        # Persist the Drive folder id in a known-place: we re-use header_image_url
-        # column as a generic per-campaign opaque source pointer (already exists).
-        await update_campaign(campaign_id, header_image_url=drive_folder_id)
+        # Persist the Drive folder id (reuse header_image_url column as a generic
+        # per-campaign opaque source pointer) and the filename pattern.
+        await update_campaign(
+            campaign_id,
+            header_image_url=drive_folder_id,
+            pdf_filename_template=filename_template,
+        )
 
     result = await upsert_dues_recipients(campaign_id, records)
 
@@ -2656,6 +2673,7 @@ async def dues_upload(request: Request):
         "template": template_name,
         "language": language,
         "drive_folder_id": drive_folder_id,
+        "filename_template": filename_template,
         "skipped_no_numbers": skipped_no_numbers,
         "preview": records[:5],
     }
@@ -2727,7 +2745,8 @@ async def dues_stage_media(campaign_id: str):
     drive_folder_id = (campaign.get("header_image_url") or DUES_DRIVE_FOLDER_ID_DEFAULT or "").strip()
     if not drive_folder_id:
         raise HTTPException(status_code=400, detail="No Drive folder ID configured for this campaign")
-    media_staging.start_staging(campaign_id, drive_folder_id)
+    filename_template = (campaign.get("pdf_filename_template") or DUES_PDF_FILENAME_TEMPLATE or "").strip()
+    media_staging.start_staging(campaign_id, drive_folder_id, filename_template=filename_template)
     return {"status": "starting", "campaign_id": campaign_id}
 
 

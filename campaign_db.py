@@ -59,6 +59,13 @@ async def init_campaign_tables():
             await db.commit()
         except Exception:
             pass  # Column already exists
+        # Migration: add pdf_filename_template for dues campaigns (per-campaign so
+        # different campaigns can match files with different naming conventions).
+        try:
+            await db.execute("ALTER TABLE campaigns ADD COLUMN pdf_filename_template TEXT DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
         await db.execute("""
             CREATE TABLE IF NOT EXISTS campaign_recipients (
                 id              TEXT PRIMARY KEY,
@@ -172,7 +179,7 @@ _CAMPAIGN_ALLOWED_COLUMNS = {
     "name", "template_name", "template_category", "language", "template_params", "status",
     "recipient_count", "sent_count", "delivered_count", "read_count",
     "failed_count", "rate_limit_per_min", "started_at", "completed_at", "source",
-    "header_image_url",
+    "header_image_url", "pdf_filename_template",
 }
 
 
