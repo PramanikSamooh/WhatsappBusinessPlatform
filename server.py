@@ -3066,6 +3066,55 @@ async def dues_stage_cancel(campaign_id: str):
     return {"status": "cancelled" if cancelled else "not_running"}
 
 
+@app.post("/api/dues/campaigns/{campaign_id}/stage-retry-errored", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_stage_retry_errored(campaign_id: str):
+    """Clear staging_status='error' on all recipients of a campaign and kick
+    staging again. Use this after a partial staging run failed some rows."""
+    campaign = await get_campaign(campaign_id)
+    if not campaign or campaign.get("source") != "dues":
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if media_staging.is_staging(campaign_id):
+        raise HTTPException(status_code=409, detail="Staging already in progress; cancel it first.")
+
+    # Reset all error rows to pending so get_recipients_for_staging picks them up.
+    reset_count = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, extra_data FROM campaign_recipients WHERE campaign_id = ?",
+            (campaign_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            try:
+                extra = json.loads(row["extra_data"] or "{}")
+            except (ValueError, TypeError):
+                extra = {}
+            if extra.get("staging_status") in ("error", "missing"):
+                extra["staging_status"] = "pending"
+                extra["staging_error"] = ""
+                extra.pop("media_id", None)
+                extra.pop("media_expires_at", None)
+                await db.execute(
+                    "UPDATE campaign_recipients SET extra_data = ? WHERE id = ?",
+                    (json.dumps(extra, ensure_ascii=False), row["id"]),
+                )
+                reset_count += 1
+        await db.commit()
+
+    drive_folder_id = (campaign.get("header_image_url") or DUES_DRIVE_FOLDER_ID_DEFAULT or "").strip()
+    if not drive_folder_id:
+        raise HTTPException(status_code=400, detail="No Drive folder ID configured for this campaign")
+    filename_template = (campaign.get("pdf_filename_template") or DUES_PDF_FILENAME_TEMPLATE or "").strip()
+    display_filename_template = (campaign.get("pdf_display_filename_template") or "").strip()
+    media_staging.start_staging(
+        campaign_id, drive_folder_id,
+        filename_template=filename_template,
+        display_filename_template=display_filename_template or None,
+    )
+    return {"status": "starting", "campaign_id": campaign_id, "reset_count": reset_count}
+
+
 @app.post("/api/dues/campaigns/{campaign_id}/start", dependencies=[Depends(require_rooms_auth_csrf)])
 async def dues_start_campaign(campaign_id: str, request: Request, background_tasks: BackgroundTasks):
     campaign = await get_campaign(campaign_id)

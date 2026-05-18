@@ -192,7 +192,7 @@ async def download_pdf(file_id: str, max_bytes: int = 100 * 1024 * 1024) -> byte
     headers = {"Accept": "application/pdf"}
 
     last_err = ""
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             session = await _get_session()
             async with session.get(url, params=params, headers=headers) as resp:
@@ -206,8 +206,16 @@ async def download_pdf(file_id: str, max_bytes: int = 100 * 1024 * 1024) -> byte
                     return data
                 body = await resp.text()
                 last_err = f"{resp.status} {ct or 'no-ct'}: {body[:200]}"
-                if resp.status in (429, 500, 502, 503, 504):
-                    await asyncio.sleep(2 ** attempt)
+                # Drive returns 403 with reason "userRateLimitExceeded" /
+                # "rateLimitExceeded" / "quotaExceeded" — all transient.
+                lowered = body.lower()
+                soft_403 = resp.status == 403 and (
+                    "ratelimitexceeded" in lowered or "quotaexceeded" in lowered
+                )
+                if resp.status in (429, 500, 502, 503, 504) or soft_403:
+                    wait = (2 ** attempt) + 0.5 * attempt
+                    logger.info(f"Drive download {file_id} got {resp.status}; retrying in {wait:.1f}s")
+                    await asyncio.sleep(wait)
                     continue
                 # Not retryable
                 break

@@ -27,7 +27,7 @@ from db import DB_PATH
 from gdrive import download_pdf, list_folder_pdfs
 from whatsapp_messaging import upload_media_pdf
 
-DUES_STAGING_RPS = float(os.getenv("DUES_STAGING_RPS", "5"))
+DUES_STAGING_RPS = float(os.getenv("DUES_STAGING_RPS", "3"))
 DUES_MEDIA_TTL_DAYS = int(os.getenv("DUES_MEDIA_TTL_DAYS", "29"))
 
 # Tracking dicts (campaign_id keyed)

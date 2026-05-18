@@ -545,11 +545,14 @@ async function refreshCampaignDetail(id) {
         if (sp.total) {
             const pct = sp.total ? Math.round((sp.staged||0) * 100 / sp.total) : 0;
             stageBox.classList.remove('hidden');
-            const stillStaging = c.staging_running ? '<span class="text-blue-600 font-medium">staging in progress...</span>' : '';
-            const missingList = sp.missing > 0 ? `<div class="text-xs text-red-600 mt-1">${sp.missing} PDFs missing. They will be skipped.</div>` : '';
+            const stillStaging = c.staging_running ? '<a href="#" class="text-blue-600 font-medium">staging in progress...</a>' : '';
+            const missingList = sp.missing > 0 ? `<div class="text-xs text-red-600 mt-1">${sp.missing} PDFs missing in Drive. They will be skipped.</div>` : '';
+            const retryBtn = (!c.staging_running && (sp.error > 0 || sp.missing > 0))
+                ? `<button onclick="retryErroredStaging('${c.id}')" class="text-xs bg-orange-100 text-orange-700 rounded px-2 py-0.5 ml-2 hover:bg-orange-200">Retry ${sp.error+sp.missing} errored/missing</button>`
+                : '';
             stageBox.innerHTML = `
                 <div class="flex items-center justify-between text-xs mb-1">
-                    <span><b>Media staging:</b> ${sp.staged||0}/${sp.total} staged, ${sp.missing||0} missing, ${sp.error||0} errored ${stillStaging}</span>
+                    <span><b>Media staging:</b> ${sp.staged||0}/${sp.total} staged, ${sp.missing||0} missing, ${sp.error||0} errored ${stillStaging} ${retryBtn}</span>
                     <span class="font-mono">${pct}%</span>
                 </div>
                 <div class="progress-bar" style="--p:${pct}%"></div>
@@ -577,7 +580,8 @@ async function refreshCampaignDetail(id) {
 
         document.getElementById('detailRecipients').innerHTML = (c.recipients||[]).map(r => {
             const errHtml = r.error_message ? `<span class="text-red-500" title="${esc(r.error_message)}">${esc(shortError(r.error_message))}</span>` : '';
-            const stageBadge = `<span class="badge badge-${r.staging_status||'pending'}">${esc(r.staging_status||'pending')}</span>`;
+            const stageTip = r.staging_error ? ` title="${esc(r.staging_error)}"` : '';
+            const stageBadge = `<span class="badge badge-${r.staging_status||'pending'}"${stageTip}>${esc(r.staging_status||'pending')}</span>`;
             return `<tr class="border-b border-gray-100">
                 <td class="py-1 px-2 font-mono">${esc(r.serial||'')}</td>
                 <td class="py-1 px-2">${esc(r.name||'-')}</td>
@@ -634,6 +638,14 @@ async function editFilename(kind) {
 async function cancelStage(id) {
     try { await api(`/api/dues/campaigns/${id}/stage-cancel`, {method:'POST'}); refreshCampaignDetail(id); }
     catch(e) { alert('Cancel failed: '+e.message); }
+}
+async function retryErroredStaging(id) {
+    if (!confirm('Retry all rows that errored or are missing? This clears their error state and re-runs staging just for them.')) return;
+    try {
+        const resp = await api(`/api/dues/campaigns/${id}/stage-retry-errored`, {method:'POST'});
+        if (!resp.ok) { const d = await resp.json().catch(()=>({})); alert(d.detail||'Retry failed'); return; }
+        refreshCampaignDetail(id);
+    } catch(e) { alert('Retry error: '+e.message); }
 }
 
 async function downloadExport() {
