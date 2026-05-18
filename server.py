@@ -93,7 +93,8 @@ from campaign_runner import (
     stop_retry_worker,
 )
 import media_staging
-from db import complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
+import aiosqlite
+from db import DB_PATH, complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
 from knowledge import KNOWLEDGE_DIR, invalidate_cache as invalidate_knowledge_cache, load_knowledge
 from message_router import is_global_ai_enabled, route_webhook, set_global_ai_enabled
 from orders import handle_razorpay_webhook
@@ -2456,6 +2457,145 @@ async def dues_page():
     return FileResponse(str(p), media_type="text/html")
 
 
+def _count_template_vars(components: list | None) -> int:
+    """Return the count of distinct {{N}} placeholders in the BODY component.
+
+    Header media variables don't count — those are the PDF media_id, handled
+    separately. We only need to map BODY {{1}}, {{2}}, ... to Excel columns.
+    """
+    if not components:
+        return 0
+    nums = set()
+    for comp in components:
+        if (comp.get("type") or "").upper() != "BODY":
+            continue
+        text = comp.get("text") or ""
+        for m in re.finditer(r"\{\{(\d+)\}\}", text):
+            try:
+                nums.add(int(m.group(1)))
+            except ValueError:
+                pass
+        # Some templates put parameters in example.body_text instead
+        ex = comp.get("example") or {}
+        bt = ex.get("body_text") or []
+        if bt and isinstance(bt, list) and bt and isinstance(bt[0], list):
+            nums.update(range(1, len(bt[0]) + 1))
+    return max(nums) if nums else 0
+
+
+def _template_header_type(components: list | None) -> str:
+    """Return the header format ('DOCUMENT', 'IMAGE', 'TEXT', ...) or '' if none."""
+    if not components:
+        return ""
+    for comp in components:
+        if (comp.get("type") or "").upper() == "HEADER":
+            return (comp.get("format") or "").upper()
+    return ""
+
+
+@app.get("/api/dues/templates", dependencies=[Depends(require_rooms_auth)])
+async def dues_list_templates():
+    """List approved WhatsApp templates available for dues campaigns.
+
+    Returns name/language/category + variable count + header format so the UI
+    can drive the variable-mapping section.
+    """
+    templates = await get_whatsapp_templates()
+    out = []
+    for t in templates:
+        status = (t.get("status") or "").upper()
+        if status != "APPROVED":
+            continue
+        components = t.get("components") or []
+        out.append({
+            "name": t.get("name", ""),
+            "language": t.get("language", ""),
+            "category": t.get("category", ""),
+            "header_format": _template_header_type(components),
+            "body_var_count": _count_template_vars(components),
+        })
+    # Sort: dues-looking ones first, then alphabetical
+    def _key(t):
+        return (0 if "due" in t["name"].lower() else 1, t["name"])
+    out.sort(key=_key)
+    return {"templates": out, "count": len(out)}
+
+
+def _scan_excel_headers(content_bytes: bytes) -> dict:
+    """Open an xlsx in memory and locate the header row + extract columns.
+
+    Returns {header_row_idx, headers (list, ordered), sample (list of dicts)}.
+    Raises HTTPException on failure.
+    """
+    import io
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl not installed on server")
+    try:
+        wb = load_workbook(io.BytesIO(content_bytes), read_only=True, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read Excel file: {e}")
+
+    header_row_idx = -1
+    header_values: list = []
+    for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True)):
+        if not row:
+            continue
+        lowered = [str(v).strip().lower() if v is not None else "" for v in row]
+        if "name" in lowered and any(("phone" in v) or ("mob" in v) or ("whatsapp" in v) or ("whats app" in v) for v in lowered):
+            header_row_idx = r_idx + 1
+            header_values = list(row)
+            break
+    if header_row_idx < 0:
+        wb.close()
+        raise HTTPException(status_code=400, detail="Could not find a header row with 'Name' and a phone column in the first 5 rows.")
+
+    headers = [str(v).strip() if v is not None else "" for v in header_values]
+    headers = [h for h in headers if h]
+
+    sample_rows = []
+    for row in ws.iter_rows(min_row=header_row_idx + 1, max_row=header_row_idx + 5, values_only=True):
+        if not row:
+            continue
+        rec = {}
+        for idx, h in enumerate(headers):
+            if idx < len(row) and row[idx] is not None:
+                v = row[idx]
+                if isinstance(v, float) and v == int(v):
+                    v = int(v)
+                rec[h] = str(v)
+            else:
+                rec[h] = ""
+        sample_rows.append(rec)
+    wb.close()
+    return {"header_row_idx": header_row_idx, "headers": headers, "sample": sample_rows}
+
+
+@app.post("/api/dues/probe", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_probe(request: Request):
+    """Read uploaded Excel headers + return columns and a 5-row sample.
+
+    Lets the frontend show variable-mapping dropdowns BEFORE the user commits
+    to creating a campaign.
+    """
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read form: {e}")
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    filename = getattr(file, "filename", "")
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only .xlsx files are accepted")
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 20 MB)")
+    return _scan_excel_headers(content)
+
+
 @app.post("/api/dues/upload", dependencies=[Depends(require_rooms_auth_csrf)])
 async def dues_upload(request: Request):
     """Upload Excel for a dues PDF campaign.
@@ -2498,6 +2638,27 @@ async def dues_upload(request: Request):
             status_code=400,
             detail="Filename pattern must contain '{serial}' (e.g. 'All Letters_{serial}.pdf').",
         )
+
+    # Variable mapping: form value `var_mapping` is a JSON object like
+    #   {"1": "Name", "2": "City"}
+    # mapping each {{N}} placeholder in the template body to an Excel column header.
+    var_mapping_raw = str(form.get("var_mapping") or "").strip()
+    var_mapping: dict[int, str] = {}
+    if var_mapping_raw:
+        try:
+            parsed = json.loads(var_mapping_raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("var_mapping must be a JSON object")
+            for k, v in parsed.items():
+                try:
+                    idx = int(k)
+                except (TypeError, ValueError):
+                    raise ValueError(f"var_mapping key '{k}' must be an integer")
+                if not isinstance(v, str) or not v.strip():
+                    raise ValueError(f"var_mapping value for '{k}' must be a non-empty string")
+                var_mapping[idx] = v.strip()
+        except (ValueError, TypeError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid var_mapping JSON: {e}")
 
     try:
         wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
@@ -2552,6 +2713,25 @@ async def dues_upload(request: Request):
                 detail=f"Excel must have 'S.N.' (or Serial) and 'Name' columns. Found headers: {list(headers.keys())}",
             )
 
+        # Resolve each var_mapping value (a column header) to a column index.
+        # Build header→idx lookup that preserves the original casing of headers.
+        headers_orig = {}
+        for idx, val in enumerate(header_values):
+            if val is not None:
+                headers_orig[str(val).strip()] = idx
+        var_col_idx: dict[int, int] = {}
+        for v_num, col_header in var_mapping.items():
+            if col_header in headers_orig:
+                var_col_idx[v_num] = headers_orig[col_header]
+            elif col_header.lower() in headers:
+                var_col_idx[v_num] = headers[col_header.lower()]
+            else:
+                wb.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Variable {{{{{v_num}}}}} mapped to unknown column '{col_header}'. Available: {list(headers_orig.keys())}",
+                )
+
         records = []
         skipped_no_numbers = 0
         for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
@@ -2596,24 +2776,38 @@ async def dues_upload(request: Request):
 
             pdf_filename = filename_template.format(serial=serial)
 
+            # Resolve template body variables {{1}}, {{2}}, ... from the mapping.
+            row_template_params: list[str] = []
+            if var_col_idx:
+                max_n = max(var_col_idx.keys())
+                for n in range(1, max_n + 1):
+                    if n in var_col_idx:
+                        row_template_params.append(cell(var_col_idx[n]) or "-")
+                    else:
+                        row_template_params.append("-")
+
+            extra_record = {
+                "serial": serial,
+                "name": name_val,
+                "city": city,
+                "wa_number": wa_norm,
+                "phone_number": phone_norm,
+                "alt_number": alt_norm,
+                "wa_raw": str(wa_raw),
+                "phone_raw": str(phone_raw),
+                "alt_raw": str(alt_raw),
+                "fallback_chain": chain,
+                "fallback_index": 0,
+                "pdf_filename": pdf_filename,
+                "staging_status": "pending",
+            }
+            if row_template_params:
+                extra_record["template_params"] = row_template_params
+
             records.append({
                 "phone": chain[0],
                 "name": name_val,
-                "extra_data": {
-                    "serial": serial,
-                    "name": name_val,
-                    "city": city,
-                    "wa_number": wa_norm,
-                    "phone_number": phone_norm,
-                    "alt_number": alt_norm,
-                    "wa_raw": str(wa_raw),
-                    "phone_raw": str(phone_raw),
-                    "alt_raw": str(alt_raw),
-                    "fallback_chain": chain,
-                    "fallback_index": 0,
-                    "pdf_filename": pdf_filename,
-                    "staging_status": "pending",
-                },
+                "extra_data": extra_record,
             })
 
         wb.close()
@@ -2674,6 +2868,7 @@ async def dues_upload(request: Request):
         "language": language,
         "drive_folder_id": drive_folder_id,
         "filename_template": filename_template,
+        "var_mapping": {str(k): v for k, v in var_mapping.items()},
         "skipped_no_numbers": skipped_no_numbers,
         "preview": records[:5],
     }
@@ -2731,6 +2926,64 @@ async def dues_campaign_status(campaign_id: str, recipients_limit: int = 1500):
         })
     campaign["recipients"] = enriched
     return campaign
+
+
+@app.post("/api/dues/campaigns/{campaign_id}/filename", dependencies=[Depends(require_rooms_auth_csrf)])
+async def dues_update_filename(campaign_id: str, request: Request):
+    """Update the PDF filename pattern on an existing campaign.
+
+    Optionally resets staging on all recipients so the next stage-media call
+    re-uploads each PDF to WhatsApp with the new filename (otherwise WhatsApp
+    keeps showing the old filename since it's baked into the media_id).
+    """
+    campaign = await get_campaign(campaign_id)
+    if not campaign or campaign.get("source") != "dues":
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    new_pattern = str(body.get("filename_template") or "").strip()
+    if "{serial}" not in new_pattern:
+        raise HTTPException(status_code=400, detail="Pattern must contain '{serial}'.")
+    reset_staging = bool(body.get("reset_staging", True))
+
+    await update_campaign(campaign_id, pdf_filename_template=new_pattern)
+
+    # Refresh the pre-computed pdf_filename in each recipient's extra_data so
+    # the audit/export shows the right name even before re-staging completes.
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, extra_data FROM campaign_recipients WHERE campaign_id = ?",
+            (campaign_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            try:
+                extra = json.loads(row["extra_data"] or "{}")
+            except (ValueError, TypeError):
+                extra = {}
+            serial = extra.get("serial") or ""
+            extra["pdf_filename"] = new_pattern.format(serial=serial) if serial else extra.get("pdf_filename", "")
+            if reset_staging:
+                extra["staging_status"] = "pending"
+                extra["staging_error"] = ""
+                extra.pop("media_id", None)
+                extra.pop("media_expires_at", None)
+            await db.execute(
+                "UPDATE campaign_recipients SET extra_data = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), row["id"]),
+            )
+        await db.commit()
+
+    return {
+        "status": "updated",
+        "campaign_id": campaign_id,
+        "filename_template": new_pattern,
+        "reset_staging": reset_staging,
+        "recipients": len(rows),
+    }
 
 
 @app.post("/api/dues/campaigns/{campaign_id}/stage-media", dependencies=[Depends(require_rooms_auth_csrf)])

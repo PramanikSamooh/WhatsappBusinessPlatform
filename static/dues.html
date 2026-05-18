@@ -82,25 +82,32 @@
                     </div>
                     <div class="grid grid-cols-2 gap-4">
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Template Name</label>
-                            <input type="text" id="templateName" value="gunayatan_due_letter_hi"
-                                class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Template</label>
+                            <select id="templateSelect" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <option value="">Loading approved templates...</option>
+                            </select>
+                            <p class="text-xs text-gray-400 mt-1">Approved templates only. Language is taken from the selection.</p>
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Language</label>
-                            <select id="templateLang" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
-                                <option value="hi" selected>Hindi</option>
-                                <option value="en">English</option>
-                            </select>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Campaign Name (optional)</label>
+                            <input type="text" id="campaignName" placeholder="Auto-generated if empty"
+                                class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
                         </div>
                     </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1">Campaign Name (optional)</label>
-                        <input type="text" id="campaignName" placeholder="Auto-generated if empty"
-                            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+
+                    <!-- Variable mapping (shown if selected template has body vars) -->
+                    <div id="varMapBox" class="hidden bg-blue-50 border border-blue-200 rounded-lg p-3">
+                        <p class="text-sm font-medium text-blue-900 mb-2">Template body variables</p>
+                        <p class="text-xs text-blue-800 mb-3">This template expects <span id="varCount">0</span> body parameter(s). Map each to an Excel column.</p>
+                        <div id="varMapInputs" class="space-y-2"></div>
                     </div>
-                    <button type="submit" id="uploadBtn"
-                        class="bg-blue-600 text-white rounded-lg px-6 py-2.5 font-medium hover:bg-blue-700 transition text-sm">Parse Excel</button>
+
+                    <div class="flex gap-3">
+                        <button type="button" id="probeBtn" onclick="doProbe()"
+                            class="bg-gray-200 text-gray-700 rounded-lg px-4 py-2 text-sm hover:bg-gray-300 transition">Probe Excel headers</button>
+                        <button type="submit" id="uploadBtn"
+                            class="bg-blue-600 text-white rounded-lg px-6 py-2 font-medium hover:bg-blue-700 transition text-sm">Create Campaign</button>
+                    </div>
                 </form>
 
                 <!-- Preview after upload -->
@@ -147,6 +154,11 @@
                 </div>
                 <div id="detailStats" class="grid grid-cols-5 gap-3 mb-3"></div>
                 <div id="stagingBox" class="hidden bg-gray-50 rounded-lg p-3 mb-3"></div>
+                <div id="detailFilename" class="hidden bg-gray-50 rounded-lg p-3 mb-3 text-sm">
+                    <span class="text-gray-500">Filename pattern:</span>
+                    <code id="detailFilenameValue" class="font-mono text-gray-800 mx-2">-</code>
+                    <button onclick="editFilename()" class="text-xs text-blue-600 hover:text-blue-800">Edit + re-stage</button>
+                </div>
                 <div id="detailActions" class="flex gap-2 mb-3"></div>
                 <div class="overflow-x-auto max-h-[600px] overflow-y-auto">
                     <table class="w-full text-xs">
@@ -175,6 +187,9 @@ let csrfToken = '';
 let refreshInterval = null;
 let activeCampaignId = null;
 let pendingCampaignId = null;
+let templates = [];           // approved templates list (from /api/dues/templates)
+let selectedTemplate = null;  // currently selected template object
+let probedHeaders = [];       // headers from last /api/dues/probe call
 
 function getCookie(name) {
     const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
@@ -219,6 +234,98 @@ function showApp() {
     document.getElementById('loginScreen').classList.add('hidden');
     document.getElementById('appScreen').classList.remove('hidden');
     loadCampaigns();
+    loadTemplates();
+}
+
+async function loadTemplates() {
+    try {
+        const resp = await api('/api/dues/templates');
+        if (!resp.ok) {
+            document.getElementById('templateSelect').innerHTML = '<option value="">Failed to load templates</option>';
+            return;
+        }
+        const data = await resp.json();
+        templates = data.templates || [];
+        const sel = document.getElementById('templateSelect');
+        if (!templates.length) {
+            sel.innerHTML = '<option value="">No approved templates found</option>';
+            return;
+        }
+        sel.innerHTML = '<option value="">-- choose a template --</option>' +
+            templates.map(t => `<option value="${esc(t.name)}|${esc(t.language)}">
+                ${esc(t.name)} (${esc(t.language)}, ${esc(t.category||'-')}, header=${esc(t.header_format||'NONE')}, vars=${t.body_var_count})
+            </option>`).join('');
+        sel.onchange = onTemplateChange;
+    } catch(e) { console.error('Load templates:',e); }
+}
+
+function onTemplateChange() {
+    const val = document.getElementById('templateSelect').value;
+    if (!val) { selectedTemplate = null; renderVarMapping(); return; }
+    const [name, lang] = val.split('|');
+    selectedTemplate = templates.find(t => t.name === name && t.language === lang) || null;
+    renderVarMapping();
+}
+
+function renderVarMapping() {
+    const box = document.getElementById('varMapBox');
+    const inputs = document.getElementById('varMapInputs');
+    const count = selectedTemplate ? (selectedTemplate.body_var_count || 0) : 0;
+    if (!count) { box.classList.add('hidden'); inputs.innerHTML=''; return; }
+    document.getElementById('varCount').textContent = count;
+    const optHeaders = probedHeaders.length
+        ? probedHeaders.map(h => `<option value="${esc(h)}">${esc(h)}</option>`).join('')
+        : '<option value="">(Probe Excel first to see columns)</option>';
+    const rows = [];
+    for (let i = 1; i <= count; i++) {
+        rows.push(`<div class="flex items-center gap-2">
+            <span class="text-sm font-mono w-12">{{${i}}}</span>
+            <select id="varMap_${i}" class="border border-gray-300 rounded px-2 py-1 text-sm flex-1">
+                <option value="">-- column --</option>
+                ${optHeaders}
+            </select>
+        </div>`);
+    }
+    inputs.innerHTML = rows.join('');
+    box.classList.remove('hidden');
+}
+
+function collectVarMapping() {
+    const count = selectedTemplate ? (selectedTemplate.body_var_count || 0) : 0;
+    if (!count) return {};
+    const out = {};
+    for (let i = 1; i <= count; i++) {
+        const v = document.getElementById('varMap_'+i)?.value || '';
+        if (!v) throw new Error(`Variable {{${i}}} is not mapped to a column`);
+        out[String(i)] = v;
+    }
+    return out;
+}
+
+async function doProbe() {
+    const errEl = document.getElementById('uploadError');
+    errEl.classList.add('hidden');
+    const fileInput = document.getElementById('fileInput');
+    if (!fileInput.files.length) {
+        errEl.textContent = 'Choose the Excel file first.';
+        errEl.classList.remove('hidden');
+        return;
+    }
+    const btn = document.getElementById('probeBtn');
+    btn.disabled = true; btn.textContent = 'Reading headers...';
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+    try {
+        const resp = await api('/api/dues/probe', {method:'POST', body:formData});
+        const data = await resp.json();
+        if (!resp.ok) { errEl.textContent = data.detail || 'Probe failed'; errEl.classList.remove('hidden'); return; }
+        probedHeaders = data.headers || [];
+        renderVarMapping();
+        const successEl = document.getElementById('uploadSuccess');
+        successEl.textContent = `Found ${probedHeaders.length} columns: ${probedHeaders.join(', ')}`;
+        successEl.classList.remove('hidden');
+    } catch(e) { errEl.textContent = 'Probe error: '+e.message; errEl.classList.remove('hidden'); }
+    finally { btn.disabled = false; btn.textContent = 'Probe Excel headers'; }
 }
 async function checkAuth() {
     try {
@@ -250,14 +357,29 @@ async function doUpload(event) {
     const fileInput = document.getElementById('fileInput');
     if (!fileInput.files.length) return;
 
+    if (!selectedTemplate) {
+        errEl.textContent = 'Choose a template from the dropdown first.';
+        errEl.classList.remove('hidden');
+        return;
+    }
+    let varMapping = {};
+    try {
+        varMapping = collectVarMapping();
+    } catch(e) {
+        errEl.textContent = e.message + '. Click "Probe Excel headers" to load the column list, then map each variable.';
+        errEl.classList.remove('hidden');
+        return;
+    }
+
     btn.disabled = true; btn.textContent = 'Parsing...';
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
     formData.append('drive_folder_id', document.getElementById('driveFolderId').value);
     formData.append('filename_template', document.getElementById('filenameTemplate').value);
-    formData.append('template_name', document.getElementById('templateName').value);
-    formData.append('language', document.getElementById('templateLang').value);
+    formData.append('template_name', selectedTemplate.name);
+    formData.append('language', selectedTemplate.language);
     formData.append('campaign_name', document.getElementById('campaignName').value);
+    formData.append('var_mapping', JSON.stringify(varMapping));
 
     try {
         const resp = await api('/api/dues/upload', {method:'POST', body:formData});
@@ -284,7 +406,7 @@ async function doUpload(event) {
             errEl.classList.remove('hidden');
         }
     } catch(e) { errEl.textContent = 'Upload error: '+e.message; errEl.classList.remove('hidden'); }
-    finally { btn.disabled = false; btn.textContent = 'Parse Excel'; }
+    finally { btn.disabled = false; btn.textContent = 'Create Campaign'; }
 }
 
 async function doStageMedia() {
@@ -381,6 +503,13 @@ async function refreshCampaignDetail(id) {
         const resp = await api(`/api/dues/campaigns/${id}`);
         const c = await resp.json();
         document.getElementById('detailTitle').textContent = c.name || 'Campaign';
+        const filename = c.pdf_filename_template || '';
+        if (filename) {
+            document.getElementById('detailFilenameValue').textContent = filename;
+            document.getElementById('detailFilename').classList.remove('hidden');
+        } else {
+            document.getElementById('detailFilename').classList.add('hidden');
+        }
         const s = c.recipient_stats || {};
         document.getElementById('detailStats').innerHTML = `
             <div class="bg-gray-50 rounded-lg p-3 text-center"><div class="text-xl font-bold text-gray-800">${s.total||0}</div><div class="text-xs text-gray-500">Total</div></div>
@@ -451,6 +580,26 @@ async function refreshCampaignDetail(id) {
 async function kickStage(id) {
     try { await api(`/api/dues/campaigns/${id}/stage-media`, {method:'POST'}); refreshCampaignDetail(id); }
     catch(e) { alert('Stage start failed: '+e.message); }
+}
+
+async function editFilename() {
+    if (!activeCampaignId) return;
+    const current = document.getElementById('detailFilenameValue').textContent || '';
+    const next = prompt(
+        'New filename pattern (must include {serial}). All staged PDFs will be re-uploaded so WhatsApp shows the new name.',
+        current
+    );
+    if (!next || next === current) return;
+    if (next.indexOf('{serial}') === -1) { alert('Pattern must include {serial}'); return; }
+    if (!confirm('This clears the current media_id on all recipients. You will need to click "Stage media" again. Continue?')) return;
+    try {
+        const resp = await api(`/api/dues/campaigns/${activeCampaignId}/filename`, {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({filename_template: next, reset_staging: true}),
+        });
+        if (!resp.ok) { const d = await resp.json().catch(()=>({})); alert(d.detail||'Rename failed'); return; }
+        refreshCampaignDetail(activeCampaignId);
+    } catch(e) { alert('Rename error: '+e.message); }
 }
 async function cancelStage(id) {
     try { await api(`/api/dues/campaigns/${id}/stage-cancel`, {method:'POST'}); refreshCampaignDetail(id); }
