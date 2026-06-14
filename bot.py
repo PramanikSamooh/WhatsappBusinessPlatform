@@ -77,19 +77,22 @@ def _envf(name: str, default: float) -> float:
 
 
 # --- Turn-taking / VAD tuning (env-overridable) ---
-# Mode "smart" (default): Pipecat is the single turn-taking authority. Silero VAD
-#   detects speech, Smart Turn v3 decides when the caller has *actually* finished
-#   (semantic, not just silence), and Gemini's server-side VAD is disabled. This
-#   stops the two-VADs-fighting problem that caused truncation and the bot talking
-#   over the caller. Background noise / mid-sentence pauses no longer cut callers off.
-# Mode "gemini": fall back to Gemini's own server-side VAD, tuned to be less
-#   trigger-happy. Use this only if "smart" mode misbehaves on a real call.
-_TURN_MODE = os.getenv("VOICE_TURN_MODE", "smart").lower()
+# Mode "gemini" (default): use Gemini Live's own fast server-side VAD for
+#   turn-taking, tuned to be less trigger-happy on background noise and to wait
+#   a bit longer before deciding the caller is done (no mid-sentence cutoffs).
+#   Silero VAD still runs locally to drive barge-in/interruption. This is the
+#   low-latency path that suits a speech-to-speech model like Gemini Live.
+# Mode "smart": make Pipecat the turn-taking authority (Silero + Smart Turn v3)
+#   and disable Gemini's server VAD. NOTE: in testing this added large latency
+#   (Smart Turn's semantic model repeatedly judged turns "incomplete" and only
+#   completed via a 3s silence timeout), so it is NOT the default. Only use it
+#   if you specifically want Pipecat-side turn control and accept the latency.
+_TURN_MODE = os.getenv("VOICE_TURN_MODE", "gemini").lower()
 
 # Silero VAD params — higher confidence/min_volume = ignore more background noise.
 _VAD_CONFIDENCE = _envf("VAD_CONFIDENCE", 0.8)
 _VAD_START_SECS = _envf("VAD_START_SECS", 0.2)
-_VAD_STOP_SECS = _envf("VAD_STOP_SECS", 0.4)
+_VAD_STOP_SECS = _envf("VAD_STOP_SECS", 0.2)
 _VAD_MIN_VOLUME = _envf("VAD_MIN_VOLUME", 0.7)
 
 # Gemini server-side VAD silence window (only used in "gemini" mode), in ms.
