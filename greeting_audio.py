@@ -28,7 +28,11 @@ GREETING_TEXT = os.getenv(
 )
 _GREETING_VOICE = os.getenv("GREETING_TTS_VOICE", "shimmer")
 _GREETING_MODEL = os.getenv("GREETING_TTS_MODEL", "gpt-4o-mini-tts")
-_GREETING_ENABLED = os.getenv("GREETING_ENABLED", "true").lower() in ("1", "true", "yes")
+# Default OFF: the cached clip requires inference_on_context_initialization=False,
+# which leaves Gemini Live waiting on a turn-complete handshake and can make it go
+# mute for the whole call. The dynamic Gemini greeting (~1.2s with thinking off) is
+# reliable and fast, so we prefer it. Set GREETING_ENABLED=true to opt back in.
+_GREETING_ENABLED = os.getenv("GREETING_ENABLED", "false").lower() in ("1", "true", "yes")
 
 # Module-level cache: generated once, reused for every subsequent call.
 _cache = {"pcm": None, "tried": False}
