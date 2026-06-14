@@ -284,6 +284,14 @@ async def lifespan(app: FastAPI):
     knowledge_context = load_knowledge()
     logger.info(f"Knowledge loaded: {len(knowledge_context)} characters")
 
+    # Pre-generate the cached voice greeting so the very first call is instant
+    try:
+        import greeting_audio
+
+        await greeting_audio.prewarm()
+    except Exception as e:
+        logger.warning(f"Greeting prewarm skipped: {e}")
+
     async with aiohttp.ClientSession() as session:
         whatsapp_client = WhatsAppClient(
             whatsapp_token=WHATSAPP_TOKEN,

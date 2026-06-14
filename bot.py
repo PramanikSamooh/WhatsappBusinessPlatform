@@ -19,8 +19,10 @@ from dotenv import load_dotenv
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import EndFrame, LLMRunFrame
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import EndFrame, LLMRunFrame, OutputAudioRawFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -28,13 +30,25 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
+    UserTurnStrategies,
 )
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
-from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+from pipecat.services.google.gemini_live.llm import (
+    EndSensitivity,
+    GeminiVADParams,
+    GeminiLiveLLMService,
+    InputParams,
+    StartSensitivity,
+)
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnStartStrategy
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+    TurnAnalyzerUserTurnStopStrategy,
+)
 
+import greeting_audio
 import media_storage
 from contacts_db import get_or_create_contact, is_blocked
 from db import complete_call_record, create_call_record
@@ -53,6 +67,79 @@ RECORDINGS_DIR.mkdir(exist_ok=True)
 _BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Our Business")
 _BUSINESS_SHORT = os.getenv("BUSINESS_SHORT", "")
 _BUSINESS_CITY = os.getenv("BUSINESS_CITY", "")
+
+
+def _envf(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# --- Turn-taking / VAD tuning (env-overridable) ---
+# Mode "smart" (default): Pipecat is the single turn-taking authority. Silero VAD
+#   detects speech, Smart Turn v3 decides when the caller has *actually* finished
+#   (semantic, not just silence), and Gemini's server-side VAD is disabled. This
+#   stops the two-VADs-fighting problem that caused truncation and the bot talking
+#   over the caller. Background noise / mid-sentence pauses no longer cut callers off.
+# Mode "gemini": fall back to Gemini's own server-side VAD, tuned to be less
+#   trigger-happy. Use this only if "smart" mode misbehaves on a real call.
+_TURN_MODE = os.getenv("VOICE_TURN_MODE", "smart").lower()
+
+# Silero VAD params — higher confidence/min_volume = ignore more background noise.
+_VAD_CONFIDENCE = _envf("VAD_CONFIDENCE", 0.8)
+_VAD_START_SECS = _envf("VAD_START_SECS", 0.2)
+_VAD_STOP_SECS = _envf("VAD_STOP_SECS", 0.4)
+_VAD_MIN_VOLUME = _envf("VAD_MIN_VOLUME", 0.7)
+
+# Gemini server-side VAD silence window (only used in "gemini" mode), in ms.
+_GEMINI_SILENCE_MS = int(_envf("GEMINI_SILENCE_MS", 800))
+
+
+def _build_user_params() -> LLMUserAggregatorParams:
+    """User-turn aggregation params, wired for the selected turn-taking mode."""
+    vad = SileroVADAnalyzer(
+        params=VADParams(
+            confidence=_VAD_CONFIDENCE,
+            start_secs=_VAD_START_SECS,
+            stop_secs=_VAD_STOP_SECS,
+            min_volume=_VAD_MIN_VOLUME,
+        )
+    )
+    if _TURN_MODE == "smart":
+        # Smart Turn v3 (model bundled with pipecat) decides true end-of-turn.
+        return LLMUserAggregatorParams(
+            vad_analyzer=vad,
+            user_turn_strategies=UserTurnStrategies(
+                start=[VADUserTurnStartStrategy(enable_interruptions=True)],
+                stop=[
+                    TurnAnalyzerUserTurnStopStrategy(
+                        turn_analyzer=LocalSmartTurnAnalyzerV3()
+                    )
+                ],
+            ),
+        )
+    # "gemini" mode: Silero only drives local interruption/barge-in detection;
+    # Gemini's server VAD owns end-of-turn (tuned below in _build_gemini_params).
+    return LLMUserAggregatorParams(vad_analyzer=vad)
+
+
+def _build_gemini_params() -> InputParams:
+    """Gemini Live generation + VAD params for the selected turn-taking mode."""
+    if _TURN_MODE == "smart":
+        # Disable Gemini's server VAD — Pipecat sends activity_start/end signals
+        # driven by Silero + Smart Turn, so turn-taking is fully under our control.
+        vad = GeminiVADParams(disabled=True)
+    else:
+        # Tune Gemini's server VAD: LOW sensitivity = less likely to trigger on
+        # background noise or end a turn early; longer silence window before ending.
+        vad = GeminiVADParams(
+            start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW,
+            end_sensitivity=EndSensitivity.END_SENSITIVITY_LOW,
+            prefix_padding_ms=300,
+            silence_duration_ms=_GEMINI_SILENCE_MS,
+        )
+    return InputParams(vad=vad, temperature=0.7)
 
 # Hardcoded fallback — only used if knowledge/prompt_voice.md is missing
 _DEFAULT_VOICE_PROMPT = """You are an AI voice assistant for {business_name}{business_location}.
@@ -122,28 +209,38 @@ async def run_bot(
         ),
     )
 
+    # Pre-generated greeting clip (cached). If present we play it the instant the
+    # call connects so the caller never hits dead air; Gemini then takes over.
+    greeting_pcm, greeting_rate = await greeting_audio.get_greeting_pcm()
+    use_cached_greeting = greeting_pcm is not None
+
     llm = GeminiLiveLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
         voice_id="Kore",  # Options: Aoede, Charon, Fenrir, Kore, Puck
         system_instruction=system_instruction,
+        params=_build_gemini_params(),
+        # When we play our own greeting clip, don't let Gemini also greet on
+        # connect — it would double up. Gemini speaks once the caller does.
+        inference_on_context_initialization=not use_cached_greeting,
     )
 
-    # Initial context: tell the AI to greet the caller
-    context = LLMContext(
-        [
+    # Seed the conversation context. If we're playing a cached greeting, record it
+    # as the assistant's first turn so Gemini has continuity and the transcript is
+    # accurate. Otherwise ask Gemini to generate the greeting itself.
+    if use_cached_greeting:
+        initial_messages = [{"role": "assistant", "content": greeting_audio.GREETING_TEXT}]
+    else:
+        initial_messages = [
             {
                 "role": "user",
                 "content": f"A customer is calling {_BUSINESS_SHORT or _BUSINESS_NAME}. Greet them briefly.",
             }
-        ],
-        tools=_tools,
-    )
+        ]
+    context = LLMContext(initial_messages, tools=_tools)
 
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
+        user_params=_build_user_params(),
     )
 
     # Audio recording processor — captures both user and bot audio
@@ -351,10 +448,18 @@ async def run_bot(
             except Exception as e:
                 logger.error(f"Call {call_id}: Block check failed: {e}")
 
-        # Start audio recording + trigger AI greeting IMMEDIATELY
+        # Start audio recording + greet IMMEDIATELY
         # (don't let DB/contact ops delay the greeting)
         await audiobuffer.start_recording()
-        await task.queue_frames([LLMRunFrame()])
+        if use_cached_greeting:
+            # Play the pre-generated greeting clip instantly — zero cold-start
+            # latency, so the caller hears us before they start talking.
+            await task.queue_frames(
+                [OutputAudioRawFrame(audio=greeting_pcm, sample_rate=greeting_rate, num_channels=1)]
+            )
+        else:
+            # No cached clip — fall back to a dynamic Gemini-generated greeting.
+            await task.queue_frames([LLMRunFrame()])
 
         # Housekeeping — runs after greeting is already queued
         try:
