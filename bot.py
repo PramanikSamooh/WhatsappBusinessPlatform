@@ -98,6 +98,19 @@ _VAD_MIN_VOLUME = _envf("VAD_MIN_VOLUME", 0.7)
 # Gemini server-side VAD silence window (only used in "gemini" mode), in ms.
 _GEMINI_SILENCE_MS = int(_envf("GEMINI_SILENCE_MS", 800))
 
+# Log the effective config at startup so it's never ambiguous which mode is live.
+logger.info(
+    f"VOICE CONFIG → turn_mode={_TURN_MODE!r} "
+    f"vad(confidence={_VAD_CONFIDENCE}, start={_VAD_START_SECS}, "
+    f"stop={_VAD_STOP_SECS}, min_volume={_VAD_MIN_VOLUME}) "
+    f"gemini_silence_ms={_GEMINI_SILENCE_MS}"
+)
+if _TURN_MODE == "smart":
+    logger.warning(
+        "VOICE_TURN_MODE=smart is active — this added large latency in testing and "
+        "can stall calls. Set VOICE_TURN_MODE=gemini (or unset it) for the fast path."
+    )
+
 
 def _build_user_params() -> LLMUserAggregatorParams:
     """User-turn aggregation params, wired for the selected turn-taking mode."""
@@ -457,11 +470,15 @@ async def run_bot(
         if use_cached_greeting:
             # Play the pre-generated greeting clip instantly — zero cold-start
             # latency, so the caller hears us before they start talking.
+            logger.info(
+                f"Call {call_id}: playing cached greeting clip ({len(greeting_pcm)} bytes @ {greeting_rate}Hz)"
+            )
             await task.queue_frames(
                 [OutputAudioRawFrame(audio=greeting_pcm, sample_rate=greeting_rate, num_channels=1)]
             )
         else:
             # No cached clip — fall back to a dynamic Gemini-generated greeting.
+            logger.info(f"Call {call_id}: triggering dynamic Gemini greeting (no cached clip)")
             await task.queue_frames([LLMRunFrame()])
 
         # Housekeeping — runs after greeting is already queued
