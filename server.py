@@ -449,7 +449,7 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
     if body.object != "whatsapp_business_account":
         raise HTTPException(status_code=400, detail="Invalid object type")
 
-    logger.info(f"Webhook received: {body.dict()}")
+    logger.info(f"Webhook received: {body.model_dump()}")
 
     # Extract caller info from webhook payload
     caller_phone = ""

@@ -170,15 +170,13 @@ def _build_gemini_params() -> InputParams:
         # driven by Silero + Smart Turn, so turn-taking is fully under our control.
         vad = GeminiVADParams(disabled=True)
     else:
-        # Tune Gemini's server VAD. We leave START sensitivity at Gemini's default
-        # so it detects the caller (and barge-in) responsively, but set END
-        # sensitivity LOW + a longer silence window so it does NOT cut the caller
-        # off mid-sentence on a brief pause or background noise.
-        vad = GeminiVADParams(
-            end_sensitivity=EndSensitivity.END_SENSITIVITY_LOW,
-            prefix_padding_ms=300,
-            silence_duration_ms=_GEMINI_SILENCE_MS,
-        )
+        # Use Gemini's NATIVE default server VAD (this is what worked on 0.0.102).
+        # Over-tuning it — especially end_sensitivity=LOW — made Gemini reluctant
+        # to finalize a turn, so it would not respond to short/fragmented/barge-in
+        # speech and the reply was dropped. Only override the silence window if the
+        # operator explicitly asks via GEMINI_SILENCE_MS; otherwise leave defaults.
+        _silence = os.getenv("GEMINI_SILENCE_MS")
+        vad = GeminiVADParams(silence_duration_ms=int(_silence)) if _silence else None
     kwargs = {"vad": vad, "temperature": 0.7}
     if _DISABLE_THINKING:
         # Turn off model "thinking" to cut first-reply latency (the reasoning
