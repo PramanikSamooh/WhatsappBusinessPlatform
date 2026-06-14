@@ -20,6 +20,7 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import EndFrame, LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -118,31 +119,64 @@ async def run_bot(
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_out_10ms_chunks=2,
+            # 10 ms chunks (was 20 ms). Lower number = lower perceived first-audio
+            # latency. Pipecat caps the pacing internally, so 1 is the floor.
+            audio_out_10ms_chunks=1,
         ),
     )
 
+    # Lowest-latency Gemini Live model with native audio + server-side VAD.
+    # If your key doesn't have this model, swap to gemini-2.0-flash-live-001.
+    gemini_live_model = os.getenv(
+        "GEMINI_LIVE_MODEL",
+        "gemini-2.5-flash-preview-native-audio-dialog",
+    )
     llm = GeminiLiveLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
+        model=gemini_live_model,
         voice_id="Kore",  # Options: Aoede, Charon, Fenrir, Kore, Puck
         system_instruction=system_instruction,
     )
 
-    # Initial context: tell the AI to greet the caller
+    # Pre-formed greeting — Gemini can play it back without "thinking" first,
+    # cutting first-audio latency by a few hundred ms.
+    greeting_business = _BUSINESS_SHORT or _BUSINESS_NAME
+    initial_greeting = os.getenv(
+        "VOICE_GREETING",
+        f"Say exactly one short sentence to greet the caller: 'Namaste, this is {greeting_business}. How may I help you?'",
+    )
     context = LLMContext(
         [
             {
                 "role": "user",
-                "content": f"A customer is calling {_BUSINESS_SHORT or _BUSINESS_NAME}. Greet them briefly.",
+                "content": initial_greeting,
             }
         ],
         tools=_tools,
     )
 
+    # Silero VAD tuned to ignore background noise / fans / chatter so the bot
+    # doesn't start/stop listening on ambient sound. The Gemini Live native-audio
+    # model also has its own server-side VAD; Silero here is the fallback gate
+    # before frames are sent over the wire.
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    # Higher confidence -> fewer false positives from background noise.
+                    confidence=float(os.getenv("VAD_CONFIDENCE", "0.8")),
+                    # How long continuous voice activity must persist to count as
+                    # speech start; raise slightly so quick noise spikes are ignored.
+                    start_secs=float(os.getenv("VAD_START_SECS", "0.25")),
+                    # How long silence must persist to count as speech end.
+                    # Default 0.8s feels slow; 0.6s is a good balance between
+                    # responsiveness and not interrupting the caller mid-thought.
+                    stop_secs=float(os.getenv("VAD_STOP_SECS", "0.6")),
+                    # Mute very quiet background audio so it doesn't trigger.
+                    min_volume=float(os.getenv("VAD_MIN_VOLUME", "0.6")),
+                ),
+            ),
         ),
     )
 
