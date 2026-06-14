@@ -125,18 +125,22 @@ async def run_bot(
         ),
     )
 
-    # Lowest-latency Gemini Live model with native audio + server-side VAD.
-    # If your key doesn't have this model, swap to gemini-2.0-flash-live-001.
-    gemini_live_model = os.getenv(
-        "GEMINI_LIVE_MODEL",
-        "gemini-2.5-flash-preview-native-audio-dialog",
-    )
-    llm = GeminiLiveLLMService(
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        model=gemini_live_model,
-        voice_id="Kore",  # Options: Aoede, Charon, Fenrir, Kore, Puck
-        system_instruction=system_instruction,
-    )
+    # Gemini Live model selection. Leave GEMINI_LIVE_MODEL unset to use
+    # Pipecat's default (known to work with most keys). To experiment with
+    # lower-latency variants, set GEMINI_LIVE_MODEL to one of:
+    #   gemini-2.5-flash-preview-native-audio-dialog   (lowest latency, may need allowlist)
+    #   gemini-live-2.5-flash-preview
+    #   gemini-2.0-flash-live-001                      (stable fallback)
+    gemini_live_kwargs = {
+        "api_key": os.getenv("GOOGLE_API_KEY"),
+        "voice_id": os.getenv("VOICE_ID", "Kore"),  # Aoede, Charon, Fenrir, Kore, Puck
+        "system_instruction": system_instruction,
+    }
+    gemini_live_model = os.getenv("GEMINI_LIVE_MODEL", "").strip()
+    if gemini_live_model:
+        gemini_live_kwargs["model"] = gemini_live_model
+        logger.info(f"Call {call_id}: Using Gemini Live model {gemini_live_model}")
+    llm = GeminiLiveLLMService(**gemini_live_kwargs)
 
     # Pre-formed greeting — Gemini can play it back without "thinking" first,
     # cutting first-audio latency by a few hundred ms.
