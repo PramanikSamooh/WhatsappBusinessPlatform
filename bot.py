@@ -147,14 +147,17 @@ def _build_user_params() -> LLMUserAggregatorParams:
                 ],
             ),
         )
-    # "gemini" mode: Gemini's server VAD owns end-of-turn. We must REPLACE
-    # pipecat's default stop strategy (LocalSmartTurnAnalyzerV3) with a plain
-    # VAD/transcript timeout — otherwise Smart Turn runs too and fights Gemini,
-    # causing the 3s "INCOMPLETE" stalls and dropped replies we saw in testing.
-    # (Gemini Live emits user transcripts, so SpeechTimeout has what it needs.)
+    # "gemini" mode: Gemini's server VAD owns end-of-turn AND barge-in.
+    #  - Replace pipecat's default stop strategy (LocalSmartTurnAnalyzerV3) with a
+    #    plain VAD/transcript timeout, else Smart Turn fights Gemini → 3s stalls.
+    #  - enable_interruptions=False: do NOT let pipecat's VAD broadcast its own
+    #    interruption. Gemini Live already detects barge-in via its server VAD and
+    #    broadcasts the interruption itself. Having BOTH made the interrupted turn
+    #    end via the "None" path so inference never fired and the reply was dropped.
     return LLMUserAggregatorParams(
         vad_analyzer=vad,
         user_turn_strategies=UserTurnStrategies(
+            start=[VADUserTurnStartStrategy(enable_interruptions=False)],
             stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=_USER_SPEECH_TIMEOUT)],
         ),
     )
@@ -167,10 +170,11 @@ def _build_gemini_params() -> InputParams:
         # driven by Silero + Smart Turn, so turn-taking is fully under our control.
         vad = GeminiVADParams(disabled=True)
     else:
-        # Tune Gemini's server VAD: LOW sensitivity = less likely to trigger on
-        # background noise or end a turn early; longer silence window before ending.
+        # Tune Gemini's server VAD. We leave START sensitivity at Gemini's default
+        # so it detects the caller (and barge-in) responsively, but set END
+        # sensitivity LOW + a longer silence window so it does NOT cut the caller
+        # off mid-sentence on a brief pause or background noise.
         vad = GeminiVADParams(
-            start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW,
             end_sensitivity=EndSensitivity.END_SENSITIVITY_LOW,
             prefix_padding_ms=300,
             silence_duration_ms=_GEMINI_SILENCE_MS,
