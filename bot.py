@@ -44,6 +44,9 @@ from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnStartStrategy
+from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
+    SpeechTimeoutUserTurnStopStrategy,
+)
 from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
@@ -98,12 +101,21 @@ _VAD_MIN_VOLUME = _envf("VAD_MIN_VOLUME", 0.7)
 # Gemini server-side VAD silence window (only used in "gemini" mode), in ms.
 _GEMINI_SILENCE_MS = int(_envf("GEMINI_SILENCE_MS", 800))
 
+# How long to wait after the caller pauses before treating their turn as done.
+_USER_SPEECH_TIMEOUT = _envf("USER_SPEECH_TIMEOUT", 0.6)
+
+# Gemini "thinking" adds reasoning latency (slow first reply). Off by default for
+# a snappy phone receptionist. Set GEMINI_DISABLE_THINKING=false to re-enable.
+_DISABLE_THINKING = os.getenv("GEMINI_DISABLE_THINKING", "true").lower() in ("1", "true", "yes")
+
 # Log the effective config at startup so it's never ambiguous which mode is live.
 logger.info(
     f"VOICE CONFIG → turn_mode={_TURN_MODE!r} "
     f"vad(confidence={_VAD_CONFIDENCE}, start={_VAD_START_SECS}, "
     f"stop={_VAD_STOP_SECS}, min_volume={_VAD_MIN_VOLUME}) "
-    f"gemini_silence_ms={_GEMINI_SILENCE_MS}"
+    f"gemini_silence_ms={_GEMINI_SILENCE_MS} "
+    f"user_speech_timeout={_USER_SPEECH_TIMEOUT} "
+    f"thinking={'off' if _DISABLE_THINKING else 'on'}"
 )
 if _TURN_MODE == "smart":
     logger.warning(
@@ -135,9 +147,17 @@ def _build_user_params() -> LLMUserAggregatorParams:
                 ],
             ),
         )
-    # "gemini" mode: Silero only drives local interruption/barge-in detection;
-    # Gemini's server VAD owns end-of-turn (tuned below in _build_gemini_params).
-    return LLMUserAggregatorParams(vad_analyzer=vad)
+    # "gemini" mode: Gemini's server VAD owns end-of-turn. We must REPLACE
+    # pipecat's default stop strategy (LocalSmartTurnAnalyzerV3) with a plain
+    # VAD/transcript timeout — otherwise Smart Turn runs too and fights Gemini,
+    # causing the 3s "INCOMPLETE" stalls and dropped replies we saw in testing.
+    # (Gemini Live emits user transcripts, so SpeechTimeout has what it needs.)
+    return LLMUserAggregatorParams(
+        vad_analyzer=vad,
+        user_turn_strategies=UserTurnStrategies(
+            stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=_USER_SPEECH_TIMEOUT)],
+        ),
+    )
 
 
 def _build_gemini_params() -> InputParams:
@@ -155,7 +175,17 @@ def _build_gemini_params() -> InputParams:
             prefix_padding_ms=300,
             silence_duration_ms=_GEMINI_SILENCE_MS,
         )
-    return InputParams(vad=vad, temperature=0.7)
+    kwargs = {"vad": vad, "temperature": 0.7}
+    if _DISABLE_THINKING:
+        # Turn off model "thinking" to cut first-reply latency (the reasoning
+        # tokens we saw added several seconds before the bot spoke).
+        try:
+            from google.genai.types import ThinkingConfig
+
+            kwargs["thinking"] = ThinkingConfig(thinking_budget=0)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Could not disable Gemini thinking, leaving default: {e}")
+    return InputParams(**kwargs)
 
 # Hardcoded fallback — only used if knowledge/prompt_voice.md is missing
 _DEFAULT_VOICE_PROMPT = """You are an AI voice assistant for {business_name}{business_location}.
