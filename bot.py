@@ -20,6 +20,7 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import EndFrame, LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -118,31 +119,68 @@ async def run_bot(
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_out_10ms_chunks=2,
+            # 10 ms chunks (was 20 ms). Lower number = lower perceived first-audio
+            # latency. Pipecat caps the pacing internally, so 1 is the floor.
+            audio_out_10ms_chunks=1,
         ),
     )
 
-    llm = GeminiLiveLLMService(
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        voice_id="Kore",  # Options: Aoede, Charon, Fenrir, Kore, Puck
-        system_instruction=system_instruction,
-    )
+    # Gemini Live model selection. Leave GEMINI_LIVE_MODEL unset to use
+    # Pipecat's default (known to work with most keys). To experiment with
+    # lower-latency variants, set GEMINI_LIVE_MODEL to one of:
+    #   gemini-2.5-flash-preview-native-audio-dialog   (lowest latency, may need allowlist)
+    #   gemini-live-2.5-flash-preview
+    #   gemini-2.0-flash-live-001                      (stable fallback)
+    gemini_live_kwargs = {
+        "api_key": os.getenv("GOOGLE_API_KEY"),
+        "voice_id": os.getenv("VOICE_ID", "Kore"),  # Aoede, Charon, Fenrir, Kore, Puck
+        "system_instruction": system_instruction,
+    }
+    gemini_live_model = os.getenv("GEMINI_LIVE_MODEL", "").strip()
+    if gemini_live_model:
+        gemini_live_kwargs["model"] = gemini_live_model
+        logger.info(f"Call {call_id}: Using Gemini Live model {gemini_live_model}")
+    llm = GeminiLiveLLMService(**gemini_live_kwargs)
 
-    # Initial context: tell the AI to greet the caller
+    # Pre-formed greeting — Gemini can play it back without "thinking" first,
+    # cutting first-audio latency by a few hundred ms.
+    greeting_business = _BUSINESS_SHORT or _BUSINESS_NAME
+    initial_greeting = os.getenv(
+        "VOICE_GREETING",
+        f"Say exactly one short sentence to greet the caller: 'Namaste, this is {greeting_business}. How may I help you?'",
+    )
     context = LLMContext(
         [
             {
                 "role": "user",
-                "content": f"A customer is calling {_BUSINESS_SHORT or _BUSINESS_NAME}. Greet them briefly.",
+                "content": initial_greeting,
             }
         ],
         tools=_tools,
     )
 
+    # Silero VAD tuned to ignore background noise / fans / chatter so the bot
+    # doesn't start/stop listening on ambient sound. The Gemini Live native-audio
+    # model also has its own server-side VAD; Silero here is the fallback gate
+    # before frames are sent over the wire.
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    # Higher confidence -> fewer false positives from background noise.
+                    confidence=float(os.getenv("VAD_CONFIDENCE", "0.8")),
+                    # How long continuous voice activity must persist to count as
+                    # speech start; raise slightly so quick noise spikes are ignored.
+                    start_secs=float(os.getenv("VAD_START_SECS", "0.25")),
+                    # How long silence must persist to count as speech end.
+                    # Default 0.8s feels slow; 0.6s is a good balance between
+                    # responsiveness and not interrupting the caller mid-thought.
+                    stop_secs=float(os.getenv("VAD_STOP_SECS", "0.6")),
+                    # Mute very quiet background audio so it doesn't trigger.
+                    min_volume=float(os.getenv("VAD_MIN_VOLUME", "0.6")),
+                ),
+            ),
         ),
     )
 

@@ -27,6 +27,10 @@ WHATSAPP_API_URL = (
     f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 )
 
+# Meta error codes that indicate the recipient is not on WhatsApp (or otherwise
+# undeliverable to this number) — the fallback chain should advance on these.
+NOT_ON_WHATSAPP_CODES = {131026, 131047, 131051, 470, 131045}
+
 # Shared aiohttp session — reuses TCP connections instead of creating new ones per request.
 # At 50k msgs/day this prevents socket exhaustion and TCP handshake overhead.
 _shared_session: aiohttp.ClientSession | None = None
@@ -288,7 +292,7 @@ async def send_whatsapp_template(
                 else:
                     body = await resp.text()
                     logger.warning(f"Template send failed {resp.status}: {body}")
-                    return {"success": False, "error": body[:200]}
+                    return {"success": False, "error": body[:300], "code": extract_error_code(body)}
     except Exception as e:
         logger.error(f"Failed to send template to {to_phone}: {e}")
         return {"success": False, "error": str(e)[:200]}
@@ -368,10 +372,115 @@ async def send_marketing_template(
                 else:
                     body = await resp.text()
                     logger.warning(f"Marketing template send failed {resp.status}: {body}")
-                    return {"success": False, "error": body[:200]}
+                    return {"success": False, "error": body[:300], "code": extract_error_code(body)}
     except Exception as e:
         logger.error(f"Failed to send marketing template to {to_phone}: {e}")
         return {"success": False, "error": str(e)[:200]}
+
+
+def extract_error_code(resp_body) -> int | None:
+    """Parse a Meta error response and return the numeric code, or None.
+
+    Accepts either a parsed dict or a raw string. Handles both top-level
+    `error.code` and the nested `error.error_data.messaging_product` shape.
+    """
+    if not resp_body:
+        return None
+    data = resp_body
+    if isinstance(resp_body, str):
+        try:
+            data = json.loads(resp_body)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error") or {}
+    code = err.get("code")
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str) and code.isdigit():
+        return int(code)
+    return None
+
+
+async def upload_media_pdf(file_bytes: bytes, filename: str, max_attempts: int = 4) -> dict:
+    """Upload a PDF to WhatsApp Cloud API /media and return a media_id.
+
+    Retries on 429 (rate limit) and 5xx with exponential backoff. WhatsApp's
+    /media endpoint throttles aggressive concurrent uploads — a transient 429
+    with retry-after backoff usually clears on the 2nd or 3rd attempt.
+
+    Args:
+        file_bytes: PDF binary content.
+        filename: Original filename (passed to Meta and shown to the recipient).
+        max_attempts: Max upload attempts before giving up (default 4).
+
+    Returns:
+        {"success": True, "media_id": "..."} on success,
+        {"success": False, "error": "...", "code": int|None} on failure.
+    """
+    import asyncio as _asyncio
+
+    if not all([WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID]):
+        return {"success": False, "error": "WhatsApp credentials not configured"}
+    if not file_bytes:
+        return {"success": False, "error": "Empty file"}
+
+    upload_url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    last_err = ""
+    last_code = None
+
+    for attempt in range(max_attempts):
+        # Build a fresh FormData per attempt — aiohttp does not allow re-using one.
+        form = aiohttp.FormData()
+        form.add_field("messaging_product", "whatsapp")
+        form.add_field("type", "application/pdf")
+        form.add_field("file", file_bytes, filename=filename, content_type="application/pdf")
+        try:
+            session = await _get_session()
+            async with session.post(upload_url, data=form, headers=headers) as resp:
+                body_text = await resp.text()
+                if resp.status == 200:
+                    try:
+                        data = json.loads(body_text)
+                    except (ValueError, TypeError):
+                        return {"success": False, "error": f"Invalid JSON response: {body_text[:200]}"}
+                    media_id = data.get("id", "")
+                    if not media_id:
+                        return {"success": False, "error": f"No media id in response: {body_text[:200]}"}
+                    if attempt > 0:
+                        logger.info(f"Uploaded PDF '{filename}' on attempt {attempt+1} -> media_id={media_id}")
+                    else:
+                        logger.info(f"Uploaded PDF '{filename}' ({len(file_bytes)} bytes) -> media_id={media_id}")
+                    return {"success": True, "media_id": media_id}
+
+                last_err = body_text[:300]
+                last_code = extract_error_code(body_text)
+                retryable = resp.status == 429 or 500 <= resp.status < 600
+                # Meta sometimes returns 400 with code 1 = generic "Try again later"
+                if last_code in (1, 4, 17, 32, 613):
+                    retryable = True
+                if not retryable or attempt == max_attempts - 1:
+                    logger.warning(f"PDF upload failed {resp.status} (attempt {attempt+1}/{max_attempts}): {last_err}")
+                    return {"success": False, "error": last_err, "code": last_code}
+                # Exponential backoff: 1, 2, 4, 8 seconds (jittered)
+                wait = (2 ** attempt) + (0.1 * attempt)
+                logger.info(f"PDF upload {filename} got {resp.status} (code={last_code}); retrying in {wait:.1f}s")
+                await _asyncio.sleep(wait)
+        except _asyncio.TimeoutError:
+            last_err = "timeout"
+            if attempt == max_attempts - 1:
+                logger.error(f"PDF upload timeout exhausted retries for '{filename}'")
+                return {"success": False, "error": "timeout"}
+            await _asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            last_err = str(e)
+            if attempt == max_attempts - 1:
+                logger.error(f"PDF upload exception for '{filename}': {e}")
+                return {"success": False, "error": last_err[:200]}
+            await _asyncio.sleep(2 ** attempt)
+    return {"success": False, "error": last_err or "upload failed", "code": last_code}
 
 
 async def _resolve_waba_id() -> str:
