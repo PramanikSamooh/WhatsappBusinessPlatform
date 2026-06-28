@@ -53,9 +53,11 @@ from chat_db import (
     resolve_conversation,
     add_message,
     get_or_create_conversation,
+    update_conversation,
 )
 from chatbot import handle_text_message
 from contacts_db import (
+    get_or_create_contact,
     delete_contact,
     delete_contacts_bulk,
     export_contacts,
@@ -85,6 +87,7 @@ from campaign_runner import is_campaign_running, request_pause, run_campaign
 from db import complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
 from knowledge import KNOWLEDGE_DIR, load_knowledge
 from message_router import route_webhook
+import push_notifications
 from orders import handle_razorpay_webhook
 from orders_db import get_order, get_order_stats, list_orders as list_orders_db
 from whatsapp_messaging import (
@@ -114,6 +117,8 @@ SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "")
 # Security config
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+# Dedicated service key for server-to-server callers (e.g. OneHub ERP).
+WA_API_KEY = os.getenv("WA_API_KEY", "")
 SESSION_EXPIRY_HOURS = 24
 
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "").lower() in ("production", "prod")
@@ -203,6 +208,33 @@ async def require_auth(
         token = authorization[7:]
         if token == DASHBOARD_PASSWORD:
             return
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def require_service_key(
+    session_token: str = Cookie(default=""),
+    authorization: str = Header(default=""),
+):
+    """Auth for server-to-server API clients (OneHub ERP). No CSRF.
+
+    Accepts, in order:
+    - Authorization: Bearer {WA_API_KEY}        (preferred dedicated key)
+    - Authorization: Bearer {DASHBOARD_PASSWORD} (fallback)
+    - a valid dashboard session cookie           (so the dashboard can call it)
+    """
+    if not DASHBOARD_PASSWORD and not WA_API_KEY:
+        return  # Auth disabled in dev mode
+
+    if authorization.startswith("Bearer "):
+        token = authorization[7:]
+        if WA_API_KEY and token == WA_API_KEY:
+            return
+        if DASHBOARD_PASSWORD and token == DASHBOARD_PASSWORD:
+            return
+
+    if verify_session(session_token):
+        return
 
     raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -340,6 +372,47 @@ async def service_worker():
         media_type="application/javascript",
         headers={"Service-Worker-Allowed": "/"},
     )
+
+
+# --- Web Push notifications (Android PWA) ---
+
+@app.get("/api/push/vapid-public-key", dependencies=[Depends(require_auth)])
+async def push_vapid_public_key():
+    """Expose the VAPID public key so the dashboard can subscribe."""
+    return {"enabled": push_notifications.is_enabled(), "publicKey": push_notifications.get_public_key()}
+
+
+@app.post("/api/push/subscribe", dependencies=[Depends(require_auth_csrf)])
+async def push_subscribe(request: Request):
+    """Store a browser push subscription. Body: the PushSubscription JSON."""
+    try:
+        subscription = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    ok = await push_notifications.save_subscription(subscription)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid subscription (missing endpoint)")
+    return {"status": "subscribed"}
+
+
+@app.post("/api/push/unsubscribe", dependencies=[Depends(require_auth_csrf)])
+async def push_unsubscribe(request: Request):
+    """Remove a push subscription. Body: { "endpoint": "..." }"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    await push_notifications.delete_subscription(body.get("endpoint", ""))
+    return {"status": "unsubscribed"}
+
+
+@app.post("/api/push/test", dependencies=[Depends(require_auth_csrf)])
+async def push_test():
+    """Send a test notification to all subscribed devices."""
+    count = await push_notifications.send_to_all(
+        "Test notification", "Push notifications are working ✅", tag="test"
+    )
+    return {"status": "sent", "delivered": count}
 
 
 @app.get("/api/branding")
@@ -755,6 +828,120 @@ async def send_direct_message(request: Request):
         "phone": phone,
         "conversation_id": conv["id"],
     }
+
+
+def _normalize_phone(raw: str) -> str:
+    """Strip '+' and any non-digit characters (E.164 → digits-only)."""
+    return "".join(ch for ch in (raw or "") if ch.isdigit())
+
+
+def _build_template_components(params: list, buttons: list) -> list:
+    """Build WhatsApp template `components` from a flat param array + buttons.
+
+    params  -> one body component with positional {type:text} parameters.
+    buttons -> one button component each (used by authentication_otp: a URL
+               button carrying the OTP code at index 0).
+    """
+    components = []
+    if params:
+        components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(p)} for p in params],
+        })
+    for btn in buttons or []:
+        components.append({
+            "type": "button",
+            "sub_type": btn.get("type", "url"),
+            "index": str(btn.get("index", 0)),
+            "parameters": [{"type": "text", "text": str(btn.get("param", ""))}],
+        })
+    return components
+
+
+def _template_preview(template_name: str, params: list) -> str:
+    """A short human-readable line stored in conversation history for AI context."""
+    readable = template_name.replace("onehub_", "").replace("_", " ").strip() or template_name
+    if params:
+        return f"[{readable}] " + " · ".join(str(p) for p in params)
+    return f"[{readable}]"
+
+
+@app.post("/api/whatsapp/send", dependencies=[Depends(require_service_key)])
+async def whatsapp_send(request: Request):
+    """Send an approved WhatsApp template on behalf of an external system (OneHub).
+
+    Drop-in replacement for calling the Meta Cloud API directly: it sends the
+    template AND records it into the contact's conversation, so when the student
+    replies the AI / inbox has full context.
+
+    Auth: Authorization: Bearer <WA_API_KEY>
+
+    Body: {
+        "to": "+919812345678",                 # required (any format; normalised to digits)
+        "template": "onehub_webinar_confirmation",  # required, approved template name
+        "language": "en",                      # optional, default "en"
+        "params": ["Asha", "MS Fabric 101", "https://..."],  # ordered body {{1}},{{2}}...
+        "buttons": [ {"type": "url", "index": 0, "param": "483920"} ],  # OTP only
+        "context": { "source": "confirm-webinar-payment", "user_id": "..." },  # for logging
+        "name": "Asha",                        # optional, improves the CRM contact name
+        "ai_reply": true                        # optional, default true. false = send the
+                                                #   reply to the human inbox (use for
+                                                #   admin-targeted alerts / one-way blasts).
+    }
+    Returns: { "message_id": "wamid...", "status": "sent" }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    to_raw = body.get("to", "")
+    template_name = (body.get("template") or "").strip()
+    language = (body.get("language") or "en").strip() or "en"
+    params = body.get("params") or []
+    buttons = body.get("buttons") or []
+    context = body.get("context") or {}
+    name = (body.get("name") or "").strip()
+    ai_reply = bool(body.get("ai_reply", True))
+
+    phone = _normalize_phone(to_raw)
+    if not phone or not template_name:
+        raise HTTPException(status_code=400, detail="'to' and 'template' are required")
+    if not isinstance(params, list) or not isinstance(buttons, list):
+        raise HTTPException(status_code=400, detail="'params' and 'buttons' must be arrays")
+
+    # Send the template via the Cloud API
+    components = _build_template_components(params, buttons)
+    result = await send_whatsapp_template(
+        to_phone=phone,
+        template_name=template_name,
+        language=language,
+        components=components or None,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("error", "Template send failed"))
+    wa_message_id = result.get("wa_message_id", "")
+
+    # Record for context (best-effort — never fail the send because logging hiccuped)
+    try:
+        contact = await get_or_create_contact(phone, name)
+        conv = await get_or_create_conversation(phone, name, contact["id"])
+        await add_message(
+            conv["id"], "assistant", _template_preview(template_name, params),
+            wa_message_id=wa_message_id, direction="outbound", source="erp",
+        )
+        # Tag the conversation so the AI replies in-context (template name → context).
+        await update_conversation(conv["id"], campaign=template_name)
+        if not ai_reply:
+            await toggle_ai(contact["id"], False)
+    except Exception as e:
+        logger.warning(f"whatsapp_send: context logging failed for {phone}: {e}")
+
+    logger.info(
+        f"OneHub send: {template_name} → {phone} "
+        f"[src={context.get('source', '')}, wamid={wa_message_id}, ai_reply={ai_reply}]"
+    )
+    return {"message_id": wa_message_id, "status": "sent"}
 
 
 @app.post("/api/messages/send-template", dependencies=[Depends(require_auth_csrf)])

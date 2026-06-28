@@ -23,6 +23,7 @@ from chatbot import handle_text_message
 from contacts_db import get_or_create_contact
 from orders import process_incoming_order
 import media_storage
+import push_notifications
 from whatsapp_messaging import download_whatsapp_media, mark_message_as_read, send_whatsapp_text
 
 SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "")
@@ -95,6 +96,17 @@ async def route_webhook(body: dict, knowledge_context: str) -> dict:
                 f"[contact={contact_id}, ai={'on' if ai_enabled else 'off'}]"
             )
 
+            # Notify the dashboard PWA about the inbound message (best-effort).
+            try:
+                await push_notifications.send_to_all(
+                    title=sender_name or sender_phone,
+                    body=_notification_preview(msg, msg_type),
+                    url="/static/dashboard.html",
+                    tag=f"conv-{sender_phone}",
+                )
+            except Exception as e:
+                logger.debug(f"Push notify skipped: {e}")
+
             # Route by message type
             if msg_type == "text":
                 return await _handle_text(
@@ -129,6 +141,24 @@ async def route_webhook(body: dict, knowledge_context: str) -> dict:
             return {"action": "skipped", "reason": f"unhandled type: {msg_type}"}
 
     return {"action": "skipped", "reason": "no actionable content"}
+
+
+def _notification_preview(msg: dict, msg_type: str) -> str:
+    """Build a short push-notification body for an inbound message."""
+    if msg_type == "text":
+        text = msg.get("text", {}).get("body", "")
+        return (text[:120] + "…") if len(text) > 120 else (text or "New message")
+    if msg_type == "interactive":
+        interactive = msg.get("interactive", {})
+        reply = interactive.get(interactive.get("type", ""), {})
+        return reply.get("title", "Tapped a button")
+    if msg_type == "order":
+        return "Placed an order"
+    if msg_type in ("image", "audio", "video", "document", "sticker"):
+        caption = msg.get(msg_type, {}).get("caption", "")
+        label = f"Sent {'a photo' if msg_type == 'image' else 'a ' + msg_type}"
+        return f"{label}: {caption}" if caption else label
+    return "New message"
 
 
 async def _handle_text(

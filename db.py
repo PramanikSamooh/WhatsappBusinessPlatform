@@ -70,6 +70,10 @@ async def init_db():
     from orders_db import init_orders_table
     await init_orders_table()
 
+    # Initialize push subscriptions table
+    from push_notifications import init_push_table
+    await init_push_table()
+
     # Run schema migrations for existing tables
     await _run_migrations(db_path=DB_PATH)
 
@@ -80,6 +84,7 @@ async def _run_migrations(db_path):
     """Add new columns to existing tables (safe if columns already exist)."""
     migrations = [
         ("conversations", "contact_id", "TEXT DEFAULT ''"),
+        ("conversations", "campaign", "TEXT DEFAULT ''"),
         ("messages", "direction", "TEXT DEFAULT 'inbound'"),
         ("messages", "source", "TEXT DEFAULT 'ai'"),
         ("messages", "status", "TEXT DEFAULT ''"),

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
     <title>WhatsApp Platform</title>
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#3b82f6">
@@ -43,6 +43,13 @@
         @media (max-width: 767px) {
             .inbox-list-panel, .inbox-thread-panel { width: 100% !important; }
             .hidden-mobile { display: none !important; }
+            /* Fill the visible viewport. With interactive-widget=resizes-content the
+               soft keyboard shrinks 100dvh, so the reply bar stays above the keyboard.
+               --inbox-top is the panel's distance from the top, measured in JS. */
+            #inbox-container {
+                height: calc(100dvh - var(--inbox-top, 130px) - 72px) !important;
+                min-height: 0 !important;
+            }
         }
         @media (max-width: 767px) { .modal-content { width: 100% !important; max-width: 100% !important; height: 100% !important; max-height: 100% !important; border-radius: 0 !important; margin: 0 !important; } }
         @media (max-width: 767px) { .touch-target { min-height: 44px; min-width: 44px; } }
@@ -176,7 +183,7 @@
 
         <!-- Inbox Panel (two-panel layout) -->
         <div id="panel-inbox" class="max-w-7xl mx-auto px-4 mt-3 hidden main-content-pad">
-            <div class="bg-white rounded-lg shadow-sm border flex" style="height: calc(100vh - 320px); min-height: 450px;">
+            <div id="inbox-container" class="bg-white rounded-lg shadow-sm border flex" style="height: calc(100vh - 320px); min-height: 450px;">
                 <!-- Left: Conversation List -->
                 <div id="inbox-list-wrapper" class="w-full md:w-80 border-r flex flex-col inbox-list-panel">
                     <div class="p-3 border-b">
@@ -206,9 +213,10 @@
                     <div id="inbox-messages" class="flex-1 overflow-y-auto p-4 space-y-2">
                         <p class="text-center text-sm text-gray-400 mt-20">Select a conversation to view messages</p>
                     </div>
-                    <div id="inbox-reply-bar" class="p-3 border-t hidden">
+                    <div id="inbox-reply-bar" class="p-3 border-t hidden" style="padding-bottom: max(0.75rem, env(safe-area-inset-bottom));">
                         <form onsubmit="sendInboxReply(event)" class="flex gap-2">
                             <input id="inbox-reply-input" type="text" placeholder="Type a reply..."
+                                onfocus="setTimeout(scrollInboxToBottom, 300)"
                                 class="flex-1 border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
                             <button type="button" onclick="showInteractiveModal()" class="bg-indigo-500 text-white px-2 md:px-3 py-2 rounded text-sm font-medium hover:bg-indigo-600" title="Send interactive message">
                                 <span class="hidden md:inline">Buttons</span>
@@ -856,6 +864,56 @@
         navigator.serviceWorker.register('/service-worker.js').catch(() => {});
     }
 
+    // --- Web Push notifications ---
+    function urlBase64ToUint8Array(base64String) {
+        const padding = '='.repeat((4 - base64String.length % 4) % 4);
+        const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+        const raw = atob(base64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        return arr;
+    }
+
+    let _pushSetupDone = false;
+    async function setupPush() {
+        if (_pushSetupDone) return;
+        if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return;
+        try {
+            const res = await authFetch('/api/push/vapid-public-key');
+            const { enabled, publicKey } = await res.json();
+            if (!enabled || !publicKey) return;  // push not configured server-side
+
+            let perm = Notification.permission;
+            if (perm === 'default') perm = await Notification.requestPermission();
+            if (perm !== 'granted') return;
+
+            const reg = await navigator.serviceWorker.ready;
+            let sub = await reg.pushManager.getSubscription();
+            if (!sub) {
+                sub = await reg.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey: urlBase64ToUint8Array(publicKey),
+                });
+            }
+            await authFetch('/api/push/subscribe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(sub),
+            });
+            _pushSetupDone = true;
+        } catch (e) {
+            console.warn('Push setup failed:', e);
+        }
+    }
+
+    // The permission prompt needs a user gesture in some browsers — if it's still
+    // undecided, retry on the next click.
+    function armPushGestureFallback() {
+        if (!('Notification' in window) || Notification.permission !== 'default') return;
+        const handler = () => { document.removeEventListener('click', handler); setupPush(); };
+        document.addEventListener('click', handler, { once: true });
+    }
+
     // --- Auth ---
 
     async function checkAuth() {
@@ -884,6 +942,8 @@
         document.getElementById('dashboard-screen').classList.remove('hidden');
         refreshAll();
         autoRefreshInterval = setInterval(refreshAll, 30000);
+        setupPush();
+        armPushGestureFallback();
     }
 
     async function handleLogin(e) {
@@ -987,6 +1047,7 @@
         if (!isMobile()) return;
         document.getElementById('inbox-list-wrapper').classList.add('hidden-mobile');
         document.getElementById('inbox-thread-wrapper').classList.remove('hidden-mobile');
+        adjustInboxHeight();
     }
     function showInboxList() {
         if (!isMobile()) return;
@@ -1001,6 +1062,25 @@
             document.getElementById('inbox-list-wrapper').classList.remove('hidden-mobile');
             document.getElementById('inbox-thread-wrapper').classList.remove('hidden-mobile');
         }
+        adjustInboxHeight();
+    }
+
+    // Measure the inbox panel's distance from the top of the viewport so CSS can size
+    // it to exactly fill the visible area (see #inbox-container rule). Measured while
+    // the keyboard is closed; the keyboard then shrinks 100dvh on its own.
+    function adjustInboxHeight() {
+        const container = document.getElementById('inbox-container');
+        if (!container || !isMobile() || currentTab !== 'inbox') return;
+        // rAF so the measurement runs after the panel is un-hidden and laid out.
+        requestAnimationFrame(() => {
+            const top = container.getBoundingClientRect().top;
+            if (top > 0) document.documentElement.style.setProperty('--inbox-top', Math.round(top) + 'px');
+        });
+    }
+
+    function scrollInboxToBottom() {
+        const msgs = document.getElementById('inbox-messages');
+        if (msgs) msgs.scrollTop = msgs.scrollHeight;
     }
 
     // --- Knowledge mobile split view ---
@@ -1392,7 +1472,7 @@
                 const isActive = selectedConvId === c.id;
                 const lastMsg = c.last_message;
                 const preview = lastMsg ? (lastMsg.content || '').substring(0, 50) : 'No messages';
-                const sourceIcon = lastMsg && lastMsg.source === 'manual' ? '(You)' : lastMsg && lastMsg.role === 'assistant' ? '(AI)' : '';
+                const sourceIcon = lastMsg && lastMsg.source === 'manual' ? '(You)' : lastMsg && lastMsg.source === 'erp' ? '(ERP)' : lastMsg && lastMsg.role === 'assistant' ? '(AI)' : '';
                 const isHandoff = c.status === 'handoff_pending';
                 const safeId = escapeHtml(c.id);
                 const safeContactId = escapeHtml(c.contact_id || '');
@@ -1454,7 +1534,7 @@
                 const isUser = m.role === 'user';
                 const align = isUser ? 'items-end' : 'items-start';
                 const bgClass = isUser ? 'msg-user' : 'msg-assistant';
-                const sourceLabel = m.source === 'manual' ? 'You' : m.source === 'ai' ? 'AI' : m.source === 'system' ? 'System' : '';
+                const sourceLabel = m.source === 'manual' ? 'You' : m.source === 'ai' ? 'AI' : m.source === 'erp' ? 'ERP' : m.source === 'system' ? 'System' : '';
                 // Render inline media if available
                 let mediaHtml = '';
                 if (m.media_url && m.msg_type) {
