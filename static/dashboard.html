@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>WhatsApp Platform</title>
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#3b82f6">
@@ -43,13 +43,25 @@
         @media (max-width: 767px) {
             .inbox-list-panel, .inbox-thread-panel { width: 100% !important; }
             .hidden-mobile { display: none !important; }
-            /* Fill the visible viewport. With interactive-widget=resizes-content the
-               soft keyboard shrinks 100dvh, so the reply bar stays above the keyboard.
-               --inbox-top is the panel's distance from the top, measured in JS. */
+            /* Conversation-LIST view fills the screen above the bottom nav. */
             #inbox-container {
-                height: calc(100dvh - var(--inbox-top, 130px) - 72px) !important;
+                height: calc(100dvh - var(--inbox-top, 120px) - 72px) !important;
                 min-height: 0 !important;
             }
+            /* Open THREAD view = full-screen overlay. height/top are set in JS from
+               window.visualViewport so the reply box stays above the keyboard. */
+            #inbox-thread-wrapper.thread-fs {
+                position: fixed !important;
+                left: 0;
+                width: 100% !important;
+                z-index: 60;
+                background: #fff;
+                border: 0;
+                border-radius: 0;
+            }
+            #inbox-thread-wrapper.thread-fs #inbox-messages { overscroll-behavior: contain; }
+            /* Hide the bottom nav while a thread is open so it can't overlap the input. */
+            body.thread-open .bottom-nav { display: none !important; }
         }
         @media (max-width: 767px) { .modal-content { width: 100% !important; max-width: 100% !important; height: 100% !important; max-height: 100% !important; border-radius: 0 !important; margin: 0 !important; } }
         @media (max-width: 767px) { .touch-target { min-height: 44px; min-width: 44px; } }
@@ -1043,18 +1055,62 @@
     }
 
     // --- Inbox mobile split view ---
+    // On mobile the open thread becomes a full-screen overlay whose size tracks the
+    // VisualViewport, so the reply box always sits just above the on-screen keyboard.
+    let _vvHandler = null;
+
+    function _applyThreadViewport() {
+        const wrapper = document.getElementById('inbox-thread-wrapper');
+        const vv = window.visualViewport;
+        const h = vv ? vv.height : window.innerHeight;
+        const t = vv ? vv.offsetTop : 0;
+        wrapper.style.height = h + 'px';
+        wrapper.style.top = t + 'px';
+    }
+
+    function enterMobileThread() {
+        if (!isMobile()) return;
+        const wrapper = document.getElementById('inbox-thread-wrapper');
+        wrapper.classList.add('thread-fs');
+        document.body.classList.add('thread-open');
+        _applyThreadViewport();
+        if (!_vvHandler) {
+            _vvHandler = _applyThreadViewport;
+            if (window.visualViewport) {
+                window.visualViewport.addEventListener('resize', _vvHandler);
+                window.visualViewport.addEventListener('scroll', _vvHandler);
+            }
+        }
+        setTimeout(scrollInboxToBottom, 100);
+    }
+
+    function exitMobileThread() {
+        const wrapper = document.getElementById('inbox-thread-wrapper');
+        wrapper.classList.remove('thread-fs');
+        wrapper.style.height = '';
+        wrapper.style.top = '';
+        document.body.classList.remove('thread-open');
+        if (_vvHandler && window.visualViewport) {
+            window.visualViewport.removeEventListener('resize', _vvHandler);
+            window.visualViewport.removeEventListener('scroll', _vvHandler);
+        }
+        _vvHandler = null;
+    }
+
     function showInboxThread() {
         if (!isMobile()) return;
         document.getElementById('inbox-list-wrapper').classList.add('hidden-mobile');
         document.getElementById('inbox-thread-wrapper').classList.remove('hidden-mobile');
-        adjustInboxHeight();
+        enterMobileThread();
     }
     function showInboxList() {
         if (!isMobile()) return;
+        exitMobileThread();
         document.getElementById('inbox-thread-wrapper').classList.add('hidden-mobile');
         document.getElementById('inbox-list-wrapper').classList.remove('hidden-mobile');
     }
     function resetInboxMobileView() {
+        exitMobileThread();
         if (isMobile()) {
             document.getElementById('inbox-list-wrapper').classList.remove('hidden-mobile');
             document.getElementById('inbox-thread-wrapper').classList.add('hidden-mobile');
@@ -1065,13 +1121,10 @@
         adjustInboxHeight();
     }
 
-    // Measure the inbox panel's distance from the top of the viewport so CSS can size
-    // it to exactly fill the visible area (see #inbox-container rule). Measured while
-    // the keyboard is closed; the keyboard then shrinks 100dvh on its own.
+    // List-view height: fill the screen above the bottom nav (no keyboard concerns).
     function adjustInboxHeight() {
         const container = document.getElementById('inbox-container');
         if (!container || !isMobile() || currentTab !== 'inbox') return;
-        // rAF so the measurement runs after the panel is un-hidden and laid out.
         requestAnimationFrame(() => {
             const top = container.getBoundingClientRect().top;
             if (top > 0) document.documentElement.style.setProperty('--inbox-top', Math.round(top) + 'px');
@@ -1104,11 +1157,21 @@
         }
     }
 
-    // Reset panels when resizing across breakpoint
+    // Reset panels only when the WIDTH breakpoint actually changes — NOT on every
+    // resize. The soft keyboard fires a resize (height change); resetting there would
+    // kick the user out of the open thread the moment they focus the reply box.
+    let _lastIsMobile = isMobile();
+    let _lastWidth = window.innerWidth;
     window.addEventListener('resize', () => {
-        if (currentTab === 'inbox') resetInboxMobileView();
-        if (currentTab === 'knowledge') resetKnowledgeMobileView();
-        // Re-evaluate stats visibility on resize
+        const widthChanged = window.innerWidth !== _lastWidth;
+        const breakpointChanged = isMobile() !== _lastIsMobile;
+        _lastWidth = window.innerWidth;
+        _lastIsMobile = isMobile();
+        // Only a genuine layout/orientation change should reset the split views.
+        if (widthChanged || breakpointChanged) {
+            if (currentTab === 'inbox') resetInboxMobileView();
+            if (currentTab === 'knowledge') resetKnowledgeMobileView();
+        }
         const stats = document.getElementById('stats-section');
         if (stats) stats.classList.toggle('stats-hidden', currentTab !== 'calls' && isMobile());
     });
