@@ -613,34 +613,49 @@ async def voicelink_media_stream(websocket: WebSocket, token: str):
         await websocket.close(code=1008)
         return
     await websocket.accept()
+    logger.info("VoiceLink media stream connected")
 
     # Read until "start": the docs promise a "connected" frame first, but in
     # practice VoiceLink often sends "start" straight away. VoiceLink also probes
     # reachability by opening a socket and closing it without sending anything.
+    # Frames may arrive as text or binary, so accept both (like Pipecat does).
     try:
-        start, start_raw = None, None
+        start, start_raw, frames_seen = None, None, 0
         async with asyncio.timeout(VOICELINK_START_TIMEOUT_SECS):
             while start is None:
-                raw = await websocket.receive_text()
-                event = parse_message(raw)
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+                raw = message.get("text")
+                if raw is None and message.get("bytes") is not None:
+                    raw = message["bytes"].decode("utf-8", errors="replace")
+                if not raw:
+                    continue
+                frames_seen += 1
+                if frames_seen <= 3:
+                    logger.info(f"VoiceLink frame before start: {raw[:300]}")
+                try:
+                    event = parse_message(raw)
+                except ValueError as e:
+                    logger.warning(f"Skipping unparseable VoiceLink frame: {e}")
+                    continue
                 if isinstance(event, StartEvent):
                     start, start_raw = event, raw
                 elif isinstance(event, StopEvent):
                     logger.info("VoiceLink stream stopped before start")
                     return
     except WebSocketDisconnect:
-        logger.debug("VoiceLink connection closed before start (reachability probe)")
+        logger.info("VoiceLink connection closed before start (reachability probe if no frames)")
         return
     except TimeoutError:
         logger.warning(f"VoiceLink sent no start event within {VOICELINK_START_TIMEOUT_SECS}s, closing")
         await websocket.close()
         return
-    except ValueError as e:
-        logger.warning(f"Bad VoiceLink frame before start: {e}")
-        await websocket.close()
-        return
 
-    await run_voicelink_bot(websocket, start, start_raw)
+    try:
+        await run_voicelink_bot(websocket, start, start_raw)
+    except Exception:
+        logger.exception(f"VoiceLink call {start.call_sid} crashed")
 
 
 def _find_recording_url(payload: dict) -> str:

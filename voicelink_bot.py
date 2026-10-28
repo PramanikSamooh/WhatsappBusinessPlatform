@@ -209,6 +209,9 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            # 20 ms packets (160 bytes of A-law), the telephony norm and what the
+            # WhatsApp bot uses (Pipecat's default is 40 ms).
+            audio_out_10ms_chunks=2,
             add_wav_header=False,
             serializer=serializer,
         ),
