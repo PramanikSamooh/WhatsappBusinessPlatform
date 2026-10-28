@@ -27,6 +27,63 @@ VAD and `end_call` setup.
 | Follow-up | Sends `VOICELINK_FOLLOWUP_TEMPLATE` if set. Otherwise sends the usual free-form follow-up, which only reaches callers who messaged us in the last 24 hours. |
 | n8n | Same `call_ended` hook as WhatsApp calls, with extra `channel` and `direction` fields. |
 
+## Outbound calling
+
+You can place outbound calls in three ways:
+
+- **One-off call from the dashboard:** use the **AI Call** button on a contact (Contacts tab) and type
+  what the AI should call about.
+- **One-off call from another system** (n8n, OneHub): `POST /api/voicelink/call` with
+  `Authorization: Bearer <WA_API_KEY>` and the body `{"to": "98XXXXXXXX", "name": "...", "purpose": "..."}`.
+- **Call campaigns:** open **Campaigns → AI Calls**. The AI calls a list of people one at a time,
+  for any purpose (an event invite, an admissions follow-up, a fee reminder, ...).
+
+### Call campaigns
+
+1. **New Call Campaign.** Fill in these fields:
+   - **Purpose**: what the AI opens with, e.g. "invite them to the alumni meet on 15 Nov".
+   - **Brief**: details the AI can share and answer from, such as date, venue, fees and FAQs. It
+     applies to this campaign only, so the shared knowledge base doesn't need editing for each
+     campaign.
+   - **WhatsApp template** (optional): sent to each person after a call where they spoke, for
+     example one carrying the registration link.
+   - **Call hours** (IST, default 10:00–19:00), **attempts per person** (default 2) and **retry gap**
+     (default 60 min).
+2. **Add people** with **Upload CSV** (a `phone` column and an optional `name` column) or **Add from
+   CRM** (filter by stage or tags, e.g. tag `alumni`). Duplicates and invalid numbers are skipped.
+3. **Start Calling.** People are dialled one at a time, waiting for each call to end. The number of
+   simultaneous calls is `VOICELINK_MAX_CONCURRENT_CALLS`, which defaults to 1 and should equal the
+   number of channels you own.
+
+Each person moves through these statuses:
+
+| Status | Meaning |
+|---|---|
+| pending | Not called yet |
+| dialing | VoiceLink is ringing them |
+| in call | Talking to the AI |
+| completed | Talked. Shows as "wants a callback" if they asked for a person |
+| no answer / busy | Retried after the retry gap until the attempts run out |
+| failed | VoiceLink refused the dial (shown with the reason) |
+
+Answered calls also appear in the **Calls** tab with transcript and recording.
+
+Other behaviour:
+
+- **Pause** finishes the call in progress, then stops. **Resume** carries on where it left off.
+- A campaign that was running when the server restarted (for example on a redeploy) resumes by
+  itself.
+- If VoiceLink refuses 3 dials in a row (empty wallet, bad credentials, ...), the campaign pauses
+  itself and shows the error at the top of the campaign.
+- **Export Results** downloads a CSV of every person's outcome.
+
+Before a large campaign, check:
+
+- **Wallet:** the *client* account's wallet pays for calls, at roughly ₹0.50 per minute.
+- **Throughput:** about 30 calls an hour per channel.
+- **Regulation:** for promotional calling in India, TRAI expects a registered 140-series number.
+  Only call people who have a relationship with you and haven't opted out.
+
 ## Setup
 
 1. Fill in the VoiceLink block in `.env` (see `.env.example`). Set `PUBLIC_BASE_URL`, then

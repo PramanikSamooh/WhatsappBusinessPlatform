@@ -48,6 +48,7 @@ from pipecat.transports.whatsapp.client import WhatsAppClient
 from voicelink.media.events import StartEvent, StopEvent, parse_message
 from voicelink.webhooks import parse_webhook
 
+import call_campaign_runner
 import media_storage
 import voicelink_client
 from bot import run_bot
@@ -91,6 +92,17 @@ from campaign_db import (
     update_campaign,
 )
 from campaign_runner import is_campaign_running, request_pause, run_campaign
+from call_campaign_db import (
+    add_call_recipients,
+    create_call_campaign,
+    delete_call_campaign,
+    export_call_campaign_results,
+    get_call_campaign,
+    get_call_recipient_stats,
+    list_call_campaigns,
+    list_call_recipients,
+    update_call_campaign,
+)
 from db import (
     complete_call_record,
     delete_call,
@@ -337,6 +349,8 @@ async def lifespan(app: FastAPI):
 
     if voicelink_client.is_enabled():
         logger.info(f"VoiceLink phone calling enabled for DID {voicelink_client.DID_NUMBER or '(VOICELINK_DID not set)'}")
+        # Call campaigns that were running before this restart/redeploy carry on.
+        await call_campaign_runner.resume_running_call_campaigns()
     else:
         logger.info("VoiceLink phone calling disabled (VOICELINK_URL_TOKEN not set)")
 
@@ -701,6 +715,8 @@ async def voicelink_webhook(token: str, request: Request):
             fields["hangup_reason"] = call.hangup_reason or str(call.hangup_cause)
         if fields:
             await update_call_by_voicelink_sid(call.id, **fields)
+        # Close out campaign calls that ended without being answered
+        await call_campaign_runner.handle_voicelink_webhook(str(name), call)
     except Exception as e:
         logger.error(f"Failed to store VoiceLink webhook: {e}")
     return {"status": "ok"}
@@ -754,6 +770,173 @@ async def voicelink_place_call(request: Request):
 async def voicelink_events(limit: int = 50):
     """Raw VoiceLink webhooks, newest first (for debugging the payload shape)."""
     return {"events": await get_recent_voicelink_events(limit)}
+
+
+# --- Protected: AI Call Campaigns (VoiceLink outbound) ---
+
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _call_campaign_fields(body: dict, partial: bool) -> dict:
+    """Validate call-campaign fields from a request body."""
+    fields = {}
+    for key in ("name", "purpose", "brief", "followup_template"):
+        if key in body:
+            fields[key] = str(body.get(key) or "").strip()
+    for key, lo, hi in (("max_attempts", 1, 5), ("retry_gap_minutes", 5, 24 * 60)):
+        if key in body:
+            try:
+                value = int(body[key])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"{key} must be a number")
+            fields[key] = max(lo, min(hi, value))
+    for key in ("call_window_start", "call_window_end"):
+        if key in body:
+            value = str(body[key] or "").strip()
+            if not _HHMM.match(value):
+                raise HTTPException(status_code=400, detail=f"{key} must be HH:MM (24h)")
+            fields[key] = value
+    if not partial and (not fields.get("name") or not fields.get("purpose")):
+        raise HTTPException(status_code=400, detail="name and purpose are required")
+    if "name" in fields and not fields["name"]:
+        raise HTTPException(status_code=400, detail="name cannot be empty")
+    if "purpose" in fields and not fields["purpose"]:
+        raise HTTPException(status_code=400, detail="purpose cannot be empty")
+    return fields
+
+
+async def _get_call_campaign_or_404(campaign_id: str) -> dict:
+    campaign = await get_call_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Call campaign not found")
+    return campaign
+
+
+@app.get("/api/call-campaigns", dependencies=[Depends(require_auth)])
+async def api_list_call_campaigns(status: str = "", limit: int = 100):
+    return {"campaigns": await list_call_campaigns(limit=limit, status=status)}
+
+
+@app.post("/api/call-campaigns", dependencies=[Depends(require_auth_csrf)])
+async def api_create_call_campaign(request: Request):
+    """Create an AI call campaign (draft).
+
+    Body: {
+        "name": "Alumni Meet 2026",
+        "purpose": "invite them to the alumni meet on 15 Nov",   # what the AI calls about
+        "brief": "Date, venue, agenda, how to register ...",      # details the AI can use
+        "followup_template": "alumni_meet_details",               # optional WhatsApp template
+        "max_attempts": 2, "retry_gap_minutes": 60,
+        "call_window_start": "10:00", "call_window_end": "19:00"  # IST
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    return await create_call_campaign(**_call_campaign_fields(body, partial=False))
+
+
+@app.get("/api/call-campaigns/{campaign_id}", dependencies=[Depends(require_auth)])
+async def api_get_call_campaign(campaign_id: str):
+    campaign = await _get_call_campaign_or_404(campaign_id)
+    campaign["recipient_stats"] = await get_call_recipient_stats(campaign_id)
+    campaign["is_running"] = call_campaign_runner.is_call_campaign_running(campaign_id)
+    return campaign
+
+
+@app.patch("/api/call-campaigns/{campaign_id}", dependencies=[Depends(require_auth_csrf)])
+async def api_update_call_campaign(campaign_id: str, request: Request):
+    """Edit a campaign. Allowed while running too — changes apply from the next call."""
+    await _get_call_campaign_or_404(campaign_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    fields = _call_campaign_fields(body, partial=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    return await update_call_campaign(campaign_id, **fields)
+
+
+@app.delete("/api/call-campaigns/{campaign_id}", dependencies=[Depends(require_auth_csrf)])
+async def api_delete_call_campaign(campaign_id: str):
+    try:
+        deleted = await delete_call_campaign(campaign_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Call campaign not found")
+    return {"success": True}
+
+
+@app.post("/api/call-campaigns/{campaign_id}/recipients", dependencies=[Depends(require_auth_csrf)])
+async def api_add_call_recipients(campaign_id: str, request: Request):
+    """Body: { "recipients": [ {"phone": "9812345678", "name": "Asha"}, ... ] }"""
+    await _get_call_campaign_or_404(campaign_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    records = body.get("recipients") or []
+    if not isinstance(records, list):
+        raise HTTPException(status_code=400, detail="'recipients' must be an array")
+    return await add_call_recipients(campaign_id, records)
+
+
+@app.post("/api/call-campaigns/{campaign_id}/recipients-from-contacts", dependencies=[Depends(require_auth_csrf)])
+async def api_add_call_recipients_from_contacts(campaign_id: str, request: Request):
+    """Body: { "stage": "interested", "tags": ["alumni"] } — both optional."""
+    await _get_call_campaign_or_404(campaign_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    records = await _contacts_matching(body.get("stage", ""), body.get("tags", []))
+    if not records:
+        return {"added": 0, "duplicate": 0, "invalid": 0, "message": "No matching contacts found"}
+    return await add_call_recipients(campaign_id, records)
+
+
+@app.get("/api/call-campaigns/{campaign_id}/recipients", dependencies=[Depends(require_auth)])
+async def api_list_call_recipients(campaign_id: str, limit: int = 200, offset: int = 0):
+    await _get_call_campaign_or_404(campaign_id)
+    return {"recipients": await list_call_recipients(campaign_id, limit=limit, offset=offset)}
+
+
+@app.post("/api/call-campaigns/{campaign_id}/start", dependencies=[Depends(require_auth_csrf)])
+async def api_start_call_campaign(campaign_id: str):
+    """Start or resume calling. Calls go out one at a time, within call hours."""
+    if not voicelink_client.is_enabled() or not voicelink_client.DID_NUMBER:
+        raise HTTPException(status_code=503, detail="VoiceLink calling is not configured")
+    campaign = await _get_call_campaign_or_404(campaign_id)
+    if call_campaign_runner.is_call_campaign_running(campaign_id):
+        raise HTTPException(status_code=400, detail="Campaign is already running")
+    # 'running' here means the runner died (it isn't in memory); 'completed' can be
+    # restarted after adding more recipients.
+    if campaign["status"] not in ("draft", "paused", "running", "completed"):
+        raise HTTPException(status_code=400, detail=f"Cannot start a {campaign['status']} campaign")
+    stats = await get_call_recipient_stats(campaign_id)
+    if not stats["total"]:
+        raise HTTPException(status_code=400, detail="Add recipients before starting")
+    call_campaign_runner.start_call_campaign_task(campaign_id)
+    return {"status": "running", "campaign_id": campaign_id}
+
+
+@app.post("/api/call-campaigns/{campaign_id}/pause", dependencies=[Depends(require_auth_csrf)])
+async def api_pause_call_campaign(campaign_id: str):
+    """Pause after the call in progress (if any) finishes."""
+    await _get_call_campaign_or_404(campaign_id)
+    if not call_campaign_runner.is_call_campaign_running(campaign_id):
+        raise HTTPException(status_code=400, detail="Campaign is not running")
+    call_campaign_runner.request_call_campaign_pause(campaign_id)
+    return {"status": "pausing", "campaign_id": campaign_id}
+
+
+@app.get("/api/call-campaigns/{campaign_id}/results", dependencies=[Depends(require_auth)])
+async def api_export_call_campaign(campaign_id: str):
+    await _get_call_campaign_or_404(campaign_id)
+    return {"results": await export_call_campaign_results(campaign_id)}
 
 
 # --- WhatsApp Text Message Webhook (validated by secret, not session auth) ---
@@ -1524,13 +1707,18 @@ async def api_add_recipients_from_contacts(campaign_id: str, request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    stage = body.get("stage", "")
-    tags = body.get("tags", [])
+    records = await _contacts_matching(body.get("stage", ""), body.get("tags", []))
+    if not records:
+        return {"added": 0, "duplicate": 0, "invalid": 0, "message": "No matching contacts found"}
 
-    # Fetch contacts matching criteria
+    result = await add_recipients(campaign_id, records)
+    return result
+
+
+async def _contacts_matching(stage: str, tags: list) -> list[dict]:
+    """CRM contacts filtered by stage and/or tags, as campaign recipient records."""
     contacts = await list_contacts(limit=10000, stage=stage)
 
-    # Filter by tags if specified
     if tags:
         tag_set = {t.lower().strip() for t in tags}
         filtered = []
@@ -1546,12 +1734,7 @@ async def api_add_recipients_from_contacts(campaign_id: str, request: Request):
                 filtered.append(c)
         contacts = filtered
 
-    if not contacts:
-        return {"added": 0, "duplicate": 0, "invalid": 0, "message": "No matching contacts found"}
-
-    records = [{"phone": c["phone"], "name": c.get("name", "")} for c in contacts if c.get("phone")]
-    result = await add_recipients(campaign_id, records)
-    return result
+    return [{"phone": c["phone"], "name": c.get("name", "")} for c in contacts if c.get("phone")]
 
 
 # --- Protected: Orders API ---

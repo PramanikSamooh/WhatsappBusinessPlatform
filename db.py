@@ -78,6 +78,10 @@ async def init_db():
     from campaign_db import init_campaign_tables
     await init_campaign_tables()
 
+    # Initialize AI call campaign tables (VoiceLink outbound)
+    from call_campaign_db import init_call_campaign_tables
+    await init_call_campaign_tables()
+
     # Initialize orders table
     from orders_db import init_orders_table
     await init_orders_table()

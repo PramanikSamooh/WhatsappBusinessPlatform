@@ -50,6 +50,7 @@ from bot import (
     _end_call_function,
     save_recording,
 )
+from call_campaign_db import get_call_campaign, update_call_recipient
 from chat_db import add_message, get_or_create_conversation
 from contacts_db import get_or_create_contact, is_blocked
 from db import complete_call_record, create_call_record
@@ -128,7 +129,9 @@ def _is_outbound(start: StartEvent) -> bool:
     return bool(_DID_NUMBER) and normalize_phone(start.from_number) == normalize_phone(_DID_NUMBER)
 
 
-def _build_system_prompt(outbound: bool, knowledge: str, customer_name: str, purpose: str) -> str:
+def _build_system_prompt(
+    outbound: bool, knowledge: str, customer_name: str, purpose: str, brief: str = ""
+) -> str:
     business_label = _BUSINESS_NAME
     if _BUSINESS_SHORT and _BUSINESS_SHORT != _BUSINESS_NAME:
         business_label = f"{_BUSINESS_NAME} ({_BUSINESS_SHORT})"
@@ -144,12 +147,17 @@ def _build_system_prompt(outbound: bool, knowledge: str, customer_name: str, pur
         prompt = load_prompt("voice_outbound", _DEFAULT_OUTBOUND_PROMPT).format(**values)
     else:
         prompt = load_prompt("voice", _DEFAULT_VOICE_PROMPT).format(**values)
+    if brief:
+        # Campaign-specific details (event info, FAQs) — kept out of the shared
+        # knowledge base so each campaign can carry its own.
+        prompt += f"\n\nCALL BRIEF (details for this call; use them to answer questions):\n{brief}"
     return prompt + (_TRANSFER_RULE if _TRANSFER_NUMBER else "")
 
 
-async def _send_phone_followup(phone, name, handoff_requested, transcript, topics, knowledge):
+async def _send_phone_followup(phone, name, handoff_requested, transcript, topics, knowledge, template=""):
     """WhatsApp follow-up after a phone call (template if configured, else free-form)."""
-    if not _FOLLOWUP_TEMPLATE:
+    template = template or _FOLLOWUP_TEMPLATE
+    if not template:
         await send_followup_message(
             phone, name, handoff_requested,
             transcript=transcript, topics=topics, knowledge_context=knowledge,
@@ -157,7 +165,7 @@ async def _send_phone_followup(phone, name, handoff_requested, transcript, topic
         return
     result = await send_whatsapp_template(
         to_phone=phone,
-        template_name=_FOLLOWUP_TEMPLATE,
+        template_name=template,
         language=_FOLLOWUP_TEMPLATE_LANG,
         components=[{"type": "body", "parameters": [{"type": "text", "text": name or "there"}]}],
     )
@@ -168,7 +176,7 @@ async def _send_phone_followup(phone, name, handoff_requested, transcript, topic
     contact = await get_or_create_contact(phone, name)
     conv = await get_or_create_conversation(phone, name, contact["id"])
     await add_message(
-        conv["id"], "assistant", f"[Template: {_FOLLOWUP_TEMPLATE}] (after phone call)",
+        conv["id"], "assistant", f"[Template: {template}] (after phone call)",
         wa_message_id=result.get("wa_message_id", ""), direction="outbound", source="voicelink",
     )
 
@@ -187,6 +195,12 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
     caller_phone = normalize_phone(start.to_number if outbound else start.from_number)
     caller_name = str(params.get("name") or params.get("customer_name") or "")
     purpose = str(params.get("purpose") or "")
+    # Set by call_campaign_runner for campaign calls; links this call to its recipient.
+    recipient_id = str(params.get("recipient_id") or "")
+    campaign_id = str(params.get("call_campaign_id") or "")
+    campaign = await get_call_campaign(campaign_id) if campaign_id else None
+    if campaign:
+        purpose = purpose or campaign["purpose"]
     logger.info(
         f"Call {call_id}: phone {direction} {caller_phone} ({caller_name or 'unknown'}) "
         f"voicelink_call_sid={start.call_sid} params={params}"
@@ -220,7 +234,9 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
     llm = GeminiLiveLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
         voice_id="Kore",  # same voice as WhatsApp calls
-        system_instruction=_build_system_prompt(outbound, knowledge_context, caller_name, purpose),
+        system_instruction=_build_system_prompt(
+            outbound, knowledge_context, caller_name, purpose, (campaign or {}).get("brief", "")
+        ),
         params=_build_gemini_params(),
     )
 
@@ -274,6 +290,11 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
         )
     except Exception as e:
         logger.error(f"Call {call_id}: Failed to create DB record: {e}")
+    if recipient_id:
+        try:
+            await update_call_recipient(recipient_id, status="in_call", call_id=call_id)
+        except Exception as e:
+            logger.error(f"Call {call_id}: Failed to mark campaign recipient in_call: {e}")
     if caller_phone:
         try:
             await get_or_create_contact(caller_phone, caller_name)
@@ -330,11 +351,23 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
         except Exception as e:
             logger.error(f"Call {call_id}: CRITICAL — failed to update DB record: {e}", exc_info=True)
 
+        if recipient_id:
+            try:
+                await update_call_recipient(
+                    recipient_id,
+                    status="completed",
+                    duration_seconds=duration_seconds,
+                    handoff_requested=1 if handoff_requested else 0,
+                )
+            except Exception as e:
+                logger.error(f"Call {call_id}: Failed to update campaign recipient: {e}")
+
         # Skip follow-ups for calls where nobody spoke (no answer / instant hangup).
         if caller_phone and any(t["role"] == "user" for t in transcript):
             try:
                 await _send_phone_followup(
-                    caller_phone, caller_name, handoff_requested, transcript, topics, knowledge_context
+                    caller_phone, caller_name, handoff_requested, transcript, topics, knowledge_context,
+                    template=(campaign or {}).get("followup_template", ""),
                 )
             except Exception as e:
                 logger.error(f"Call {call_id}: Failed to send WhatsApp follow-up: {e}")
