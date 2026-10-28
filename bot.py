@@ -222,6 +222,39 @@ _end_call_function = FunctionSchema(
 )
 _tools = ToolsSchema(standard_tools=[_end_call_function])
 
+
+def save_recording(call_id: str, audio: bytes, sample_rate: int, num_channels: int):
+    """Write a call's audio to recordings/{call_id}.wav and upload it to MinIO if configured.
+
+    Shared by WhatsApp calls (this file) and phone calls (voicelink_bot.py), so the
+    dashboard's /api/recordings/{call_id} player works for both.
+    """
+    recording_path = RECORDINGS_DIR / f"{call_id}.wav"
+    logger.info(f"Call {call_id}: on_audio_data fired — {len(audio) if audio else 0} bytes, {sample_rate}Hz, {num_channels}ch")
+    if not audio:
+        logger.warning(f"Call {call_id}: Empty audio buffer, skipping save")
+        return
+    try:
+        with wave.open(str(recording_path), "wb") as wf:
+            wf.setnchannels(num_channels)
+            wf.setsampwidth(2)  # 16-bit audio
+            wf.setframerate(sample_rate)
+            wf.writeframes(audio)
+        logger.info(f"Call {call_id}: Audio saved to {recording_path} ({recording_path.stat().st_size} bytes)")
+
+        # Upload to MinIO if configured
+        if media_storage.is_configured():
+            key = media_storage.build_recording_key(call_id)
+            with open(str(recording_path), "rb") as f:
+                wav_bytes = f.read()
+            if media_storage.upload_bytes(key, wav_bytes, "audio/wav"):
+                logger.info(f"Call {call_id}: Recording uploaded to MinIO: {key}")
+            else:
+                logger.warning(f"Call {call_id}: MinIO upload failed, keeping local copy")
+    except Exception as e:
+        logger.error(f"Call {call_id}: Failed to save audio: {e}")
+
+
 async def run_bot(
     webrtc_connection,
     knowledge_context: str = "",
@@ -456,30 +489,7 @@ async def run_bot(
     @audiobuffer.event_handler("on_audio_data")
     async def on_audio_data(buffer, audio, sample_rate, num_channels):
         """Save recorded audio to WAV file when recording stops."""
-        recording_path = RECORDINGS_DIR / recording_filename
-        logger.info(f"Call {call_id}: on_audio_data fired — {len(audio) if audio else 0} bytes, {sample_rate}Hz, {num_channels}ch")
-        if not audio:
-            logger.warning(f"Call {call_id}: Empty audio buffer, skipping save")
-            return
-        try:
-            with wave.open(str(recording_path), "wb") as wf:
-                wf.setnchannels(num_channels)
-                wf.setsampwidth(2)  # 16-bit audio
-                wf.setframerate(sample_rate)
-                wf.writeframes(audio)
-            logger.info(f"Call {call_id}: Audio saved to {recording_path} ({recording_path.stat().st_size} bytes)")
-
-            # Upload to MinIO if configured
-            if media_storage.is_configured():
-                key = media_storage.build_recording_key(call_id)
-                with open(str(recording_path), "rb") as f:
-                    wav_bytes = f.read()
-                if media_storage.upload_bytes(key, wav_bytes, "audio/wav"):
-                    logger.info(f"Call {call_id}: Recording uploaded to MinIO: {key}")
-                else:
-                    logger.warning(f"Call {call_id}: MinIO upload failed, keeping local copy")
-        except Exception as e:
-            logger.error(f"Call {call_id}: Failed to save audio: {e}")
+        save_recording(call_id, audio, sample_rate, num_channels)
 
     @transport.event_handler("on_client_connected")
     async def on_connected(transport_obj, client):

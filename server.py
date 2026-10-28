@@ -14,6 +14,7 @@ and posts call/chat summaries back to n8n for automation.
 
 import argparse
 import asyncio
+import hmac
 import os
 import re
 import secrets
@@ -35,6 +36,8 @@ from fastapi import (
     Header,
     HTTPException,
     Request,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,9 +45,13 @@ from loguru import logger
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.whatsapp.api import WhatsAppWebhookRequest
 from pipecat.transports.whatsapp.client import WhatsAppClient
+from voicelink.media.events import StartEvent, StopEvent, parse_message
+from voicelink.webhooks import parse_webhook
 
 import media_storage
+import voicelink_client
 from bot import run_bot
+from voicelink_bot import run_voicelink_bot
 from chat_db import (
     get_conversation,
     get_conversation_messages,
@@ -84,7 +91,19 @@ from campaign_db import (
     update_campaign,
 )
 from campaign_runner import is_campaign_running, request_pause, run_campaign
-from db import complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
+from db import (
+    complete_call_record,
+    delete_call,
+    delete_calls_bulk,
+    get_call,
+    get_recent_calls,
+    get_recent_voicelink_events,
+    get_stats,
+    init_db,
+    resolve_call,
+    save_voicelink_event,
+    update_call_by_voicelink_sid,
+)
 from knowledge import KNOWLEDGE_DIR, load_knowledge
 from message_router import route_webhook
 import push_notifications
@@ -315,6 +334,11 @@ async def lifespan(app: FastAPI):
     # Load knowledge docs at startup
     knowledge_context = load_knowledge()
     logger.info(f"Knowledge loaded: {len(knowledge_context)} characters")
+
+    if voicelink_client.is_enabled():
+        logger.info(f"VoiceLink phone calling enabled for DID {voicelink_client.DID_NUMBER or '(VOICELINK_DID not set)'}")
+    else:
+        logger.info("VoiceLink phone calling disabled (VOICELINK_URL_TOKEN not set)")
 
     # Pre-generate the cached voice greeting so the very first call is instant
     try:
@@ -569,6 +593,152 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
     except Exception as e:
         logger.error(f"Webhook processing error: {e}")
         raise HTTPException(status_code=500, detail="Internal error")
+
+
+# --- VoiceLink Phone Calls (Indian number) ---
+# VoiceLink doesn't sign media connections or webhooks, so both URLs carry
+# VOICELINK_URL_TOKEN as an unguessable path segment. Unset token = disabled.
+
+VOICELINK_START_TIMEOUT_SECS = 15
+
+
+def _voicelink_token_ok(token: str) -> bool:
+    return voicelink_client.is_enabled() and hmac.compare_digest(token, voicelink_client.URL_TOKEN)
+
+
+@app.websocket("/voicelink/ws/{token}")
+async def voicelink_media_stream(websocket: WebSocket, token: str):
+    """VoiceLink streams each phone call's audio here (inbound and outbound)."""
+    if not _voicelink_token_ok(token):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+
+    # Read until "start": the docs promise a "connected" frame first, but in
+    # practice VoiceLink often sends "start" straight away. VoiceLink also probes
+    # reachability by opening a socket and closing it without sending anything.
+    try:
+        start, start_raw = None, None
+        async with asyncio.timeout(VOICELINK_START_TIMEOUT_SECS):
+            while start is None:
+                raw = await websocket.receive_text()
+                event = parse_message(raw)
+                if isinstance(event, StartEvent):
+                    start, start_raw = event, raw
+                elif isinstance(event, StopEvent):
+                    logger.info("VoiceLink stream stopped before start")
+                    return
+    except WebSocketDisconnect:
+        logger.debug("VoiceLink connection closed before start (reachability probe)")
+        return
+    except TimeoutError:
+        logger.warning(f"VoiceLink sent no start event within {VOICELINK_START_TIMEOUT_SECS}s, closing")
+        await websocket.close()
+        return
+    except ValueError as e:
+        logger.warning(f"Bad VoiceLink frame before start: {e}")
+        await websocket.close()
+        return
+
+    await run_voicelink_bot(websocket, start, start_raw)
+
+
+def _find_recording_url(payload: dict) -> str:
+    """VoiceLink's recording URL key isn't documented consistently; look anywhere."""
+    stack = [payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if "recording" in k.lower() and isinstance(v, str) and v.startswith("http"):
+                    return v
+                stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return ""
+
+
+@app.post("/voicelink/webhook/{token}")
+async def voicelink_webhook(token: str, request: Request):
+    """VoiceLink call-lifecycle events. Always 200, or VoiceLink retries."""
+    if not _voicelink_token_ok(token):
+        raise HTTPException(status_code=404)
+    try:
+        event = parse_webhook(await request.body())
+    except ValueError as e:
+        logger.warning(f"Unparseable VoiceLink webhook: {e}")
+        return {"status": "ignored"}
+
+    name = getattr(event.event, "value", event.event)
+    call = event.call
+    logger.info(
+        f"VoiceLink webhook {name}: call={call.id} {call.direction} "
+        f"{call.from_number}->{call.to_number} status={call.status or call.call_status} "
+        f"duration={call.duration_sec}"
+    )
+    try:
+        await save_voicelink_event(str(name), call.id, call.outbound_queue_id, event.raw)
+        fields = {}
+        recording_url = _find_recording_url(event.raw)
+        if recording_url:
+            fields["voicelink_recording_url"] = recording_url
+        if call.hangup_reason or call.hangup_cause:
+            fields["hangup_reason"] = call.hangup_reason or str(call.hangup_cause)
+        if fields:
+            await update_call_by_voicelink_sid(call.id, **fields)
+    except Exception as e:
+        logger.error(f"Failed to store VoiceLink webhook: {e}")
+    return {"status": "ok"}
+
+
+@app.post("/api/voicelink/call", dependencies=[Depends(require_service_key)])
+async def voicelink_place_call(request: Request):
+    """Place an outbound AI phone call from the VoiceLink number.
+
+    Auth: Authorization: Bearer <WA_API_KEY> (or a dashboard session).
+
+    Body: {
+        "to": "9812345678",               # required; 10-digit, 91…, or +91…
+        "name": "Asha",                    # optional, the AI greets them by name
+        "purpose": "follow up on her MBA enquiry",  # optional, what the AI calls about
+        "custom_parameters": {...}         # optional, stored with the call
+    }
+    Returns: { "status": "queued", "outbound_queue_id": 123 }
+
+    Dials a real phone and uses VoiceLink wallet balance.
+    """
+    if not voicelink_client.is_enabled() or not voicelink_client.DID_NUMBER:
+        raise HTTPException(status_code=503, detail="VoiceLink calling is not configured")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    to = str(body.get("to") or "").strip()
+    if not to:
+        raise HTTPException(status_code=400, detail="'to' is required")
+    extra = body.get("custom_parameters") or {}
+    if not isinstance(extra, dict):
+        raise HTTPException(status_code=400, detail="'custom_parameters' must be an object")
+    params = {
+        **extra,
+        "direction": "outbound",
+        "name": str(body.get("name") or ""),
+        "purpose": str(body.get("purpose") or ""),
+    }
+    try:
+        # The SDK is synchronous (httpx) — keep it off the event loop.
+        queue_id = await asyncio.to_thread(voicelink_client.place_call, to, params)
+    except Exception as e:
+        logger.error(f"VoiceLink add_lead failed for {to}: {e}")
+        raise HTTPException(status_code=502, detail=f"VoiceLink error: {e}")
+    logger.info(f"VoiceLink outbound call to {to} queued (queue id {queue_id})")
+    return {"status": "queued", "outbound_queue_id": queue_id}
+
+
+@app.get("/api/voicelink/events", dependencies=[Depends(require_auth)])
+async def voicelink_events(limit: int = 50):
+    """Raw VoiceLink webhooks, newest first (for debugging the payload shape)."""
+    return {"events": await get_recent_voicelink_events(limit)}
 
 
 # --- WhatsApp Text Message Webhook (validated by secret, not session auth) ---

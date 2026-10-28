@@ -1188,6 +1188,13 @@
         return `<span class="badge ${cls}">${stage || 'new'}</span>`;
     }
 
+    // Phone calls (VoiceLink) share the calls list with WhatsApp calls; WhatsApp gets no badge.
+    function channelBadge(c) {
+        if (c.channel !== 'phone') return '';
+        const label = c.direction === 'outbound' ? 'Phone · Outbound' : 'Phone';
+        return ` <span class="badge bg-indigo-100 text-indigo-700">${label}</span>`;
+    }
+
     function topicBadges(topics) {
         if (!topics || !topics.length) return '<span class="text-gray-300">-</span>';
         return topics.map(t => `<span class="badge bg-gray-100 text-gray-600">${t}</span>`).join(' ');
@@ -1413,7 +1420,7 @@
                     <tr class="border-b hover:bg-gray-50 cursor-pointer" onclick="toggleTranscript('call-${safeId}')">
                         <td class="px-2 py-2" onclick="event.stopPropagation()"><input type="checkbox" onchange="toggleCallSelect('${safeId}', this.checked)" class="call-select-cb"></td>
                         <td class="px-4 py-2">${escapeHtml(c.caller_name || '-')}</td>
-                        <td class="px-4 py-2 font-mono text-xs">${escapeHtml(c.caller_phone || '-')}</td>
+                        <td class="px-4 py-2 font-mono text-xs">${escapeHtml(c.caller_phone || '-')}${channelBadge(c)}</td>
                         <td class="px-4 py-2">${formatDuration(c.duration_seconds)}</td>
                         <td class="px-4 py-2">${statusBadge(c.status)}</td>
                         <td class="px-4 py-2">${topicBadges(c.topics)}</td>
@@ -1447,7 +1454,7 @@
                             ${statusBadge(c.status)}
                         </div>
                         <div class="flex items-center justify-between text-xs text-gray-500 mb-2">
-                            <span class="font-mono">${escapeHtml(c.caller_phone || '-')}</span>
+                            <span class="font-mono">${escapeHtml(c.caller_phone || '-')}${channelBadge(c)}</span>
                             <span>${formatDuration(c.duration_seconds)} &middot; ${formatTime(c.connected_at || c.created_at)}</span>
                         </div>
                         <div class="mb-2">${topicBadges(c.topics)}</div>

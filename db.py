@@ -52,6 +52,18 @@ async def init_db():
                 created_at       TEXT DEFAULT (datetime('now'))
             )
         """)
+        # Raw VoiceLink call-lifecycle webhooks, kept verbatim because the real
+        # payload shape differs from VoiceLink's docs.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS voicelink_events (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                event             TEXT,
+                voicelink_call_id TEXT,
+                outbound_queue_id INTEGER,
+                payload           TEXT,
+                received_at       TEXT DEFAULT (datetime('now'))
+            )
+        """)
         await db.commit()
 
     # Initialize chat tables (conversations + messages)
@@ -90,6 +102,13 @@ async def _run_migrations(db_path):
         ("messages", "status", "TEXT DEFAULT ''"),
         ("messages", "media_key", "TEXT DEFAULT ''"),
         ("messages", "msg_type", "TEXT DEFAULT 'text'"),
+        # Phone calls over VoiceLink share the calls table with WhatsApp calls
+        ("calls", "channel", "TEXT DEFAULT 'whatsapp'"),
+        ("calls", "direction", "TEXT DEFAULT 'inbound'"),
+        ("calls", "voicelink_call_sid", "TEXT DEFAULT ''"),
+        ("calls", "voicelink_recording_url", "TEXT DEFAULT ''"),
+        ("calls", "hangup_reason", "TEXT DEFAULT ''"),
+        ("calls", "transferred_to", "TEXT DEFAULT ''"),
     ]
     async with aiosqlite.connect(db_path) as db:
         for table, column, col_type in migrations:
@@ -101,12 +120,21 @@ async def _run_migrations(db_path):
         await db.commit()
 
 
-async def create_call_record(call_id: str, caller_phone: str, caller_name: str, connected_at: str):
+async def create_call_record(
+    call_id: str,
+    caller_phone: str,
+    caller_name: str,
+    connected_at: str,
+    channel: str = "whatsapp",
+    direction: str = "inbound",
+    voicelink_call_sid: str = "",
+):
     """Insert initial call record when call connects."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO calls (id, caller_phone, caller_name, connected_at, status) VALUES (?, ?, ?, ?, 'active')",
-            (call_id, caller_phone, caller_name, connected_at),
+            "INSERT INTO calls (id, caller_phone, caller_name, connected_at, status, "
+            "channel, direction, voicelink_call_sid) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+            (call_id, caller_phone, caller_name, connected_at, channel, direction, voicelink_call_sid),
         )
         await db.commit()
     logger.debug(f"Call {call_id}: DB record created for {caller_phone}")
@@ -116,6 +144,7 @@ _CALLS_ALLOWED_COLUMNS = {
     "caller_phone", "caller_name", "connected_at", "disconnected_at",
     "duration_seconds", "transcript", "recording_path", "handoff_requested",
     "handoff_reason", "topics", "status",
+    "voicelink_recording_url", "hangup_reason", "transferred_to",
 }
 
 
@@ -131,6 +160,42 @@ async def complete_call_record(call_id: str, **kwargs):
         await db.execute(f"UPDATE calls SET {set_clause} WHERE id = ?", values)
         await db.commit()
     logger.debug(f"Call {call_id}: DB record updated")
+
+
+async def update_call_by_voicelink_sid(voicelink_call_sid: str, **kwargs) -> int:
+    """Attach VoiceLink webhook data (recording URL, hangup reason) to its call."""
+    if not voicelink_call_sid or not kwargs:
+        return 0
+    _validate_columns(kwargs, _CALLS_ALLOWED_COLUMNS)
+    set_clause = ", ".join(f"{k} = ?" for k in kwargs)
+    values = list(kwargs.values()) + [voicelink_call_sid]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"UPDATE calls SET {set_clause} WHERE voicelink_call_sid = ?", values
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def save_voicelink_event(
+    event: str, voicelink_call_id: str | None, outbound_queue_id: int | None, payload: dict
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO voicelink_events (event, voicelink_call_id, outbound_queue_id, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (event, voicelink_call_id, outbound_queue_id, json.dumps(payload, ensure_ascii=False)),
+        )
+        await db.commit()
+
+
+async def get_recent_voicelink_events(limit: int = 50) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM voicelink_events ORDER BY id DESC LIMIT ?", (limit,)
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
 
 
 async def get_call(call_id: str) -> dict | None:
