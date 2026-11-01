@@ -67,6 +67,13 @@ _DID_NUMBER = os.getenv("VOICELINK_DID", "")
 # Number the AI transfers to when a caller asks for a human. Blank = no
 # transfer tool; the AI offers a callback instead (as on WhatsApp calls).
 _TRANSFER_NUMBER = os.getenv("VOICELINK_TRANSFER_NUMBER", "")
+# VoiceLink's transfer example uses a bare 10-digit number; strip +91 / 91 / 0.
+_transfer_digits = "".join(c for c in _TRANSFER_NUMBER if c.isdigit())
+if len(_transfer_digits) == 12 and _transfer_digits.startswith("91"):
+    _transfer_digits = _transfer_digits[2:]
+elif len(_transfer_digits) == 11 and _transfer_digits.startswith("0"):
+    _transfer_digits = _transfer_digits[1:]
+_TRANSFER_TARGET = _transfer_digits or _TRANSFER_NUMBER
 # Approved WhatsApp template sent after a phone call ({{1}} = caller name).
 # Phone callers usually have no open 24h WhatsApp window, so free-form
 # follow-ups (send_followup_message) only reach people who recently messaged us.
@@ -393,6 +400,14 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
 
     async def handle_end_call(fn: FunctionCallParams):
         reason = fn.arguments.get("reason", "conversation complete")
+        if state["transferred_to"]:
+            # Closing the stream mid-transfer makes VoiceLink drop the whole call,
+            # including the leg to the human. VoiceLink ends the stream itself.
+            logger.info(f"Call {call_id}: ignoring end_call during transfer — {reason}")
+            await fn.result_callback(
+                {"status": "ignored", "instruction": "The call is being transferred. Stay silent."}
+            )
+            return
         logger.info(f"Call {call_id}: LLM triggered end_call — {reason}")
         await fn.result_callback({"status": "ending_call", "reason": reason})
         # Let the goodbye finish playing, then close the stream so VoiceLink hangs up.
@@ -401,13 +416,21 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
 
     async def handle_transfer_call(fn: FunctionCallParams):
         reason = fn.arguments.get("reason", "")
-        logger.info(f"Call {call_id}: transferring to {_TRANSFER_NUMBER} — {reason}")
-        await fn.result_callback({"status": "transferring"})
+        if state["transferred_to"]:
+            await fn.result_callback({"status": "already_transferring"})
+            return
+        # Set before the pause so an end_call arriving meanwhile is ignored.
+        state["transferred_to"] = _TRANSFER_TARGET
+        logger.info(f"Call {call_id}: transferring to {_TRANSFER_TARGET} — {reason}")
+        await fn.result_callback({
+            "status": "transferring",
+            "instruction": "The call is being connected to a team member now. "
+                           "Say nothing more and do not call end_call.",
+        })
         await asyncio.sleep(2)  # let "connecting you now" finish playing
-        state["transferred_to"] = _TRANSFER_NUMBER
-        await task.queue_frame(
-            OutputTransportMessageUrgentFrame(message=build_transfer(_TRANSFER_NUMBER))
-        )
+        message = build_transfer(_TRANSFER_TARGET)
+        logger.info(f"Call {call_id}: sending VoiceLink transfer {message}")
+        await task.queue_frame(OutputTransportMessageUrgentFrame(message=message))
 
     llm.register_function("end_call", handle_end_call)
     if _TRANSFER_NUMBER:
