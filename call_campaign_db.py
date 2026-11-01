@@ -294,16 +294,23 @@ async def mark_attempt_unanswered(recipient_id: str, status: str, retry_gap_minu
     )
 
 
-async def reset_interrupted_recipients(campaign_id: str):
-    """After a restart, attempts that were mid-call can't be resumed — count them as unanswered."""
+async def reset_interrupted_recipients(campaign_id: str | None = None):
+    """After a restart, attempts that were mid-call can't be resumed — count them as unanswered.
+
+    With no campaign_id, applies to every campaign (used at startup).
+    """
     placeholders = ",".join("?" for _ in ACTIVE_RECIPIENT_STATUSES)
+    query = (
+        f"UPDATE call_campaign_recipients SET status = 'no_answer', "
+        f"hangup_reason = 'interrupted by server restart' "
+        f"WHERE status IN ({placeholders})"
+    )
+    params: list = list(ACTIVE_RECIPIENT_STATUSES)
+    if campaign_id:
+        query += " AND campaign_id = ?"
+        params.append(campaign_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            f"UPDATE call_campaign_recipients SET status = 'no_answer', "
-            f"hangup_reason = 'interrupted by server restart' "
-            f"WHERE campaign_id = ? AND status IN ({placeholders})",
-            (campaign_id, *ACTIVE_RECIPIENT_STATUSES),
-        )
+        await db.execute(query, params)
         await db.commit()
 
 

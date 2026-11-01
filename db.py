@@ -152,6 +152,26 @@ _CALLS_ALLOWED_COLUMNS = {
 }
 
 
+async def close_stale_active_calls() -> int:
+    """Mark calls left 'active' by a restart or crash as expired.
+
+    Called at startup, when no call can still be in progress — so every
+    'active' row is a call whose finalize step never ran.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE calls SET status = 'expired', disconnected_at = COALESCE(disconnected_at, ?) "
+            "WHERE status = 'active'",
+            (now,),
+        )
+        await db.commit()
+        count = cursor.rowcount
+    if count:
+        logger.info(f"Closed {count} call record(s) left active by a restart")
+    return count
+
+
 async def complete_call_record(call_id: str, **kwargs):
     """Update call record when call ends. Accepts whitelisted columns as keyword arguments."""
     if not kwargs:

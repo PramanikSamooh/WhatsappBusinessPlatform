@@ -108,6 +108,27 @@ _transfer_call_function = FunctionSchema(
 )
 
 
+# Live phone calls, so VoiceLink's call.ended webhook can close a session whose
+# media stream VoiceLink left open (seen after a call transfer) — otherwise the
+# call is never saved. Keyed by VoiceLink call id and by caller number, since the
+# webhook's call id isn't guaranteed to match the start frame's.
+_live_calls: dict[str, PipelineTask] = {}
+_ENDED_GRACE_SECS = 5  # give the stream time to close on its own first
+
+
+async def end_live_call(voicelink_call_id: str | None, phones: list[str]):
+    """Called when VoiceLink reports a call ended: close our session if it's still open."""
+    keys = [k for k in [voicelink_call_id, *(normalize_phone(p) for p in phones)] if k]
+    task = next((_live_calls[k] for k in keys if k in _live_calls), None)
+    if not task:
+        return
+    await asyncio.sleep(_ENDED_GRACE_SECS)
+    if task.has_finished():
+        return
+    logger.info(f"VoiceLink reported call {voicelink_call_id} ended but its stream is still open; closing it")
+    await task.cancel()
+
+
 def normalize_phone(raw: str | None) -> str:
     """VoiceLink sends 10-digit, 0-prefixed, 91-prefixed or +91 numbers.
 
@@ -447,9 +468,16 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
         logger.info(f"Call {call_id}: VoiceLink disconnected")
         await task.cancel()
 
+    live_keys = [k for k in (start.call_sid, caller_phone) if k]
+    for key in live_keys:
+        _live_calls[key] = task
     try:
         await PipelineRunner(handle_sigint=False).run(task)
     finally:
-        # Runs whether the caller hung up (VoiceLink "stop"), the AI hung up, or
-        # the socket dropped — so every phone call is saved exactly once.
+        for key in live_keys:
+            if _live_calls.get(key) is task:
+                del _live_calls[key]
+        # Runs whether the caller hung up (VoiceLink "stop"), the AI hung up, the
+        # socket dropped, or VoiceLink reported the call ended (end_live_call) —
+        # so every phone call is saved exactly once.
         await finalize_call()

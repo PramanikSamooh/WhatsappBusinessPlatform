@@ -52,7 +52,7 @@ import call_campaign_runner
 import media_storage
 import voicelink_client
 from bot import run_bot
-from voicelink_bot import run_voicelink_bot
+from voicelink_bot import end_live_call, run_voicelink_bot
 from chat_db import (
     get_conversation,
     get_conversation_messages,
@@ -101,9 +101,11 @@ from call_campaign_db import (
     get_call_recipient_stats,
     list_call_campaigns,
     list_call_recipients,
+    reset_interrupted_recipients,
     update_call_campaign,
 )
 from db import (
+    close_stale_active_calls,
     complete_call_record,
     delete_call,
     delete_calls_bulk,
@@ -339,6 +341,10 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     await init_db()
+
+    # No call survives a restart: close out records left mid-call by the last one
+    await close_stale_active_calls()
+    await reset_interrupted_recipients()
 
     # Initialize MinIO bucket + lifecycle rules
     media_storage.init_bucket()
@@ -614,6 +620,8 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
 # VOICELINK_URL_TOKEN as an unguessable path segment. Unset token = disabled.
 
 VOICELINK_START_TIMEOUT_SECS = 15
+# Fire-and-forget tasks started from webhooks; referenced so they aren't GC'd.
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _voicelink_token_ok(token: str) -> bool:
@@ -717,6 +725,14 @@ async def voicelink_webhook(token: str, request: Request):
             await update_call_by_voicelink_sid(call.id, **fields)
         # Close out campaign calls that ended without being answered
         await call_campaign_runner.handle_voicelink_webhook(str(name), call)
+        # If our AI session for this call is somehow still open, end and save it.
+        # Runs in the background: it waits a few seconds and VoiceLink needs its 200 now.
+        if str(name) in ("call.ended", "call.completed", "call.failed"):
+            task = asyncio.create_task(
+                end_live_call(call.id, [call.from_number or "", call.to_number or ""])
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
     except Exception as e:
         logger.error(f"Failed to store VoiceLink webhook: {e}")
     return {"status": "ok"}
