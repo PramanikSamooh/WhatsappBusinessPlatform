@@ -67,10 +67,10 @@ _DID_NUMBER = os.getenv("VOICELINK_DID", "")
 # Number the AI transfers to when a caller asks for a human. Blank = no
 # transfer tool; the AI offers a callback instead (as on WhatsApp calls).
 _TRANSFER_NUMBER = os.getenv("VOICELINK_TRANSFER_NUMBER", "")
-# Sent to VoiceLink digits-only but otherwise exactly as configured. Its docs show
-# a bare 10-digit example, yet a live transfer to 10 digits failed instantly with
-# NOANSWER, so the format is left to the setting (try 9829393505 / 919829393505).
-_TRANSFER_TARGET = "".join(c for c in _TRANSFER_NUMBER if c.isdigit()) or _TRANSFER_NUMBER
+# VoiceLink support confirmed transfers take the bare 10-digit number, so
+# +91 / 91 / 0 prefixes in the setting are dropped.
+_TRANSFER_DIGITS = "".join(c for c in _TRANSFER_NUMBER if c.isdigit())
+_TRANSFER_TARGET = _TRANSFER_DIGITS[-10:] if len(_TRANSFER_DIGITS) > 10 else _TRANSFER_DIGITS
 # Approved WhatsApp template sent after a phone call ({{1}} = caller name).
 # Phone callers usually have no open 24h WhatsApp window, so free-form
 # follow-ups (send_followup_message) only reach people who recently messaged us.
