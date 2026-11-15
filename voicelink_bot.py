@@ -1,10 +1,10 @@
 """IFS AI Voice Bot — phone calls over VoiceLink
 
-Same agent as bot.py (Gemini Live, same knowledge, prompts, VAD/turn-taking
-config and end_call tool), but for normal phone calls on the VoiceLink Indian
-number instead of WhatsApp calls:
+Same agent as bot.py (same voice engine — Gemini Live or Sarvam — knowledge,
+prompts, VAD/turn-taking config and end_call tool), but for normal phone calls
+on the VoiceLink Indian number instead of WhatsApp calls:
 
-    caller <-> VoiceLink (PSTN) <-> wss://.../voicelink/ws/<token> <-> Pipecat <-> Gemini Live
+    caller <-> VoiceLink (PSTN) <-> wss://.../voicelink/ws/<token> <-> Pipecat <-> AI
 
 VoiceLink streams base64 G.711 A-law @ 8 kHz as JSON frames. The official
 VoiceLinkFrameSerializer (pip install "voicelink[pipecat]") converts that to
@@ -33,7 +33,6 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
-from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
@@ -45,9 +44,8 @@ from voicelink.media.events import StartEvent, build_transfer
 import media_storage
 from bot import (
     _DEFAULT_VOICE_PROMPT,
-    _build_gemini_params,
-    _build_user_params,
     _end_call_function,
+    build_voice_services,
     save_recording,
 )
 from call_campaign_db import get_call_campaign, update_call_recipient
@@ -77,8 +75,8 @@ _TRANSFER_TARGET = _TRANSFER_DIGITS[-10:] if len(_TRANSFER_DIGITS) > 10 else _TR
 _FOLLOWUP_TEMPLATE = os.getenv("VOICELINK_FOLLOWUP_TEMPLATE", "")
 _FOLLOWUP_TEMPLATE_LANG = os.getenv("VOICELINK_FOLLOWUP_TEMPLATE_LANG", "en")
 
-# Gemini Live takes 16 kHz in and speaks 24 kHz out; the serializer resamples
-# VoiceLink's 8 kHz A-law to and from these.
+# Both voice engines take 16 kHz in and speak 24 kHz out; the serializer
+# resamples VoiceLink's 8 kHz A-law to and from these.
 _PIPELINE_IN_RATE = 16000
 _PIPELINE_OUT_RATE = 24000
 
@@ -256,13 +254,11 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
         ),
     )
 
-    llm = GeminiLiveLLMService(
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        voice_id="Kore",  # same voice as WhatsApp calls
-        system_instruction=_build_system_prompt(
+    # Same engine and voice as WhatsApp calls (VOICE_ENGINE: gemini or sarvam).
+    voice_services, llm, user_params = build_voice_services(
+        _build_system_prompt(
             outbound, knowledge_context, caller_name, purpose, (campaign or {}).get("brief", "")
-        ),
-        params=_build_gemini_params(),
+        )
     )
 
     if outbound:
@@ -277,7 +273,7 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
         [{"role": "user", "content": kickoff}], tools=ToolsSchema(standard_tools=tools)
     )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context, user_params=_build_user_params()
+        context, user_params=user_params
     )
     audiobuffer = AudioBufferProcessor(num_channels=1)
 
@@ -285,7 +281,7 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
         [
             transport.input(),
             user_aggregator,
-            llm,
+            *voice_services,
             transport.output(),
             audiobuffer,
             assistant_aggregator,

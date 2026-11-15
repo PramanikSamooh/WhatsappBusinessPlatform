@@ -6,14 +6,23 @@ WhatsApp calls, marked with a **Phone** badge. They share the same contacts, blo
 transcript, recording, WhatsApp follow-up and n8n hook.
 
 ```
-Caller ⇄ VoiceLink (PSTN) ⇄ wss://<host>/voicelink/ws/<token> ⇄ Pipecat ⇄ Gemini Live
+Caller ⇄ VoiceLink (PSTN) ⇄ wss://<host>/voicelink/ws/<token> ⇄ Pipecat ⇄ AI (Gemini Live or Sarvam)
                          └─ https://<host>/voicelink/webhook/<token>   (call events)
 ```
 
 VoiceLink streams base64 G.711 A-law at 8 kHz as JSON over a WebSocket. The official
 `voicelink[pipecat]` SDK provides `VoiceLinkFrameSerializer`, which converts it to PCM and back.
-No SIP is involved. The agent's code is in `voicelink_bot.py`, and it reuses `bot.py`'s Gemini,
+No SIP is involved. The agent's code is in `voicelink_bot.py`, and it reuses `bot.py`'s voice engine,
 VAD and `end_call` setup.
+
+`VOICE_ENGINE` picks the AI for both phone and WhatsApp calls:
+
+| `VOICE_ENGINE` | Pipeline | Keys |
+|---|---|---|
+| `gemini` (default) | Gemini Live: listens, thinks and speaks in one model | `GOOGLE_API_KEY` |
+| `sarvam` | Saaras v4 speech-to-text → `sarvam-105b-conversations` → Bulbul v4 Flash voice | `SARVAM_API_KEY` |
+
+Sarvam settings: `SARVAM_TTS_SPEAKER` (default `simran_enhi_customer`), `SARVAM_TTS_LANGUAGE` (default `hi-IN`), `SARVAM_TTS_PACE`, and `SARVAM_KEYTERMS` (comma-separated words to recognise, such as course names). Switching back is just `VOICE_ENGINE=gemini` and a redeploy.
 
 ## Behaviour
 
@@ -22,7 +31,7 @@ VAD and `end_call` setup.
 | Inbound | Uses `knowledge/prompt_voice.md`, the same prompt as WhatsApp calls. Blocked contacts are dropped. |
 | Outbound | `POST /api/voicelink/call` with `{to, name, purpose}`. VoiceLink dials the number, then the AI opens with the purpose (`knowledge/prompt_voice_outbound.md`). |
 | Transfer | Only active when `VOICELINK_TRANSFER_NUMBER` is set. A caller who asks for a human is transferred through a VoiceLink `transfer` event. |
-| Hang-up | Gemini calls `end_call` after saying goodbye. The server then closes the stream. |
+| Hang-up | The AI calls `end_call` after saying goodbye. The server then closes the stream. |
 | Records | Rows go into the `calls` table with `channel='phone'`. The server also records a WAV file (and uploads to MinIO if configured), so the dashboard player works. VoiceLink's own recording URL and hangup reason are attached from webhooks. |
 | Follow-up | Sends `VOICELINK_FOLLOWUP_TEMPLATE` if set. Otherwise sends the usual free-form follow-up, which only reaches callers who messaged us in the last 24 hours. |
 | n8n | Same `call_ended` hook as WhatsApp calls, with extra `channel` and `direction` fields. |
@@ -122,5 +131,5 @@ captured calls. Confirm these on the first live calls:
 |---|---|
 | Call answers, then drops in under 1 s (cause 32) | Turn off the bot's "WebSocket API" toggle in the portal, or the wss host isn't reachable. |
 | Outbound fails with "38 – Network out of order" | Number format. The code already sends the national number with `country_code=91`. |
-| Answered but silent | The app is up but the AI isn't running. Check the logs and `GOOGLE_API_KEY`. |
+| Answered but silent | The app is up but the AI isn't running. Check the logs, and `GOOGLE_API_KEY` or `SARVAM_API_KEY` (and its credit) for the engine in use. A Sarvam speaker name it rejects also shows in the logs. |
 | Logs show alaw @ 8000 though the bot is set to l16_16k | Normal. VoiceLink ignores that setting and the serializer adapts. |

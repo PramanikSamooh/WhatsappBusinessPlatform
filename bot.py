@@ -1,7 +1,8 @@
 """IFS AI Voice Bot Pipeline
 
-Pipecat pipeline using Gemini Live for real-time voice conversation.
-Gemini handles STT + LLM + TTS natively in a single model.
+Pipecat pipeline for real-time voice conversation. VOICE_ENGINE picks the AI:
+Gemini Live (STT + LLM + TTS in one model, the default) or Sarvam
+(Saaras v4 STT -> Sarvam LLM -> Bulbul v4 Flash TTS).
 
 Phase 2: Adds conversation transcription, call recording, handoff detection,
 SQLite storage, WhatsApp follow-up messaging, and enriched n8n hooks.
@@ -189,6 +190,103 @@ def _build_gemini_params() -> InputParams:
             logger.warning(f"Could not disable Gemini thinking, leaving default: {e}")
     return InputParams(**kwargs)
 
+
+# --- Voice engine ---
+# "gemini" (default): Gemini Live does listening, thinking and speaking in one model.
+# "sarvam": Sarvam Saaras v4 (speech-to-text) -> Sarvam LLM -> Bulbul v4 Flash
+#   (text-to-speech). Needs SARVAM_API_KEY; no Google key used for calls.
+VOICE_ENGINE = os.getenv("VOICE_ENGINE", "gemini").lower()
+_SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v4")
+_SARVAM_LLM_MODEL = os.getenv("SARVAM_LLM_MODEL", "sarvam-105b-conversations")
+_SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v4-flash")
+# Code-mixed Hindi/English customer-support persona; see Sarvam's Voices guide.
+_SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "simran_enhi_customer")
+_SARVAM_TTS_LANGUAGE = os.getenv("SARVAM_TTS_LANGUAGE", "hi-IN")
+_SARVAM_TTS_PACE = _envf("SARVAM_TTS_PACE", 1.0)
+# Comma-separated words the caller is likely to say (course names, brand), to
+# help speech-to-text spell them right.
+_SARVAM_KEYTERMS = [t.strip() for t in os.getenv("SARVAM_KEYTERMS", "").split(",") if t.strip()]
+
+# Gemini speaks for itself; a text LLM's words go to a TTS voice, so it needs these.
+_SPOKEN_OUTPUT_RULES = """
+
+SPOKEN OUTPUT (your words are read aloud by a text-to-speech voice):
+- Plain spoken sentences only: no markdown, bullet points, emojis, or URLs.
+- Write Hindi in Devanagari script and English words in English script.
+- Write numbers above four digits with commas (10,000) and say "rupees" instead of the ₹ sign.
+"""
+
+logger.info(
+    f"VOICE ENGINE → {VOICE_ENGINE}"
+    + (
+        f" (stt={_SARVAM_STT_MODEL}, llm={_SARVAM_LLM_MODEL}, tts={_SARVAM_TTS_MODEL}, "
+        f"speaker={_SARVAM_TTS_SPEAKER}, language={_SARVAM_TTS_LANGUAGE})"
+        if VOICE_ENGINE == "sarvam" else ""
+    )
+)
+
+
+def build_voice_services(system_instruction: str, greet_on_connect: bool = True):
+    """Build the speech/LLM services for a call on the configured VOICE_ENGINE.
+
+    Returns (services, llm, user_params): ``services`` sit between the user and
+    assistant aggregators in the pipeline, and ``llm`` is where the call's
+    function tools (end_call, transfer_call) are registered. Used by both
+    WhatsApp calls (this file) and phone calls (voicelink_bot.py).
+    """
+    if VOICE_ENGINE != "sarvam":
+        llm = GeminiLiveLLMService(
+            api_key=os.getenv("GOOGLE_API_KEY"),
+            voice_id="Kore",  # Options: Aoede, Charon, Fenrir, Kore, Puck
+            system_instruction=system_instruction,
+            params=_build_gemini_params(),
+            inference_on_context_initialization=greet_on_connect,
+        )
+        return [llm], llm, _build_user_params()
+
+    from pipecat.services.sarvam.llm import SarvamLLMService
+    from pipecat.services.sarvam.stt import SarvamRealtimeSTTService
+    from pipecat.services.sarvam.tts import SarvamTTSService
+    from pipecat.transcriptions.language import Language
+
+    api_key = os.getenv("SARVAM_API_KEY", "")
+    # Saaras detects each utterance's language and when the caller has finished
+    # speaking (server-side endpointing), and handles barge-in.
+    stt = SarvamRealtimeSTTService(
+        api_key=api_key,
+        keyterms=_SARVAM_KEYTERMS or None,
+        settings=SarvamRealtimeSTTService.Settings(model=_SARVAM_STT_MODEL, language=None),
+    )
+    llm = SarvamLLMService(
+        api_key=api_key,
+        settings=SarvamLLMService.Settings(
+            model=_SARVAM_LLM_MODEL,
+            system_instruction=system_instruction + _SPOKEN_OUTPUT_RULES,
+            temperature=0.7,
+            max_tokens=300,  # replies are a few spoken sentences
+        ),
+    )
+    tts = SarvamTTSService(
+        api_key=api_key,
+        settings=SarvamTTSService.Settings(
+            model=_SARVAM_TTS_MODEL,
+            voice=_SARVAM_TTS_SPEAKER,
+            language=Language(_SARVAM_TTS_LANGUAGE),
+            pace=_SARVAM_TTS_PACE,
+        ),
+    )
+    vad = SileroVADAnalyzer(
+        params=VADParams(
+            confidence=_VAD_CONFIDENCE,
+            start_secs=_VAD_START_SECS,
+            stop_secs=_VAD_STOP_SECS,
+            min_volume=_VAD_MIN_VOLUME,
+        )
+    )
+    # No user_turn_strategies: the aggregator adopts the ones Saaras recommends.
+    return [stt, llm, tts], llm, LLMUserAggregatorParams(vad_analyzer=vad)
+
+
 # Hardcoded fallback — only used if knowledge/prompt_voice.md is missing
 _DEFAULT_VOICE_PROMPT = """You are an AI voice assistant for {business_name}{business_location}.
 
@@ -295,19 +393,16 @@ async def run_bot(
     greeting_pcm, greeting_rate = await greeting_audio.get_greeting_pcm()
     use_cached_greeting = greeting_pcm is not None
 
-    llm = GeminiLiveLLMService(
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        voice_id="Kore",  # Options: Aoede, Charon, Fenrir, Kore, Puck
-        system_instruction=system_instruction,
-        params=_build_gemini_params(),
+    voice_services, llm, user_params = build_voice_services(
+        system_instruction,
         # When we play our own greeting clip, don't let Gemini also greet on
         # connect — it would double up. Gemini speaks once the caller does.
-        inference_on_context_initialization=not use_cached_greeting,
+        greet_on_connect=not use_cached_greeting,
     )
 
     # Seed the conversation context. If we're playing a cached greeting, record it
-    # as the assistant's first turn so Gemini has continuity and the transcript is
-    # accurate. Otherwise ask Gemini to generate the greeting itself.
+    # as the assistant's first turn so the AI has continuity and the transcript is
+    # accurate. Otherwise ask the AI to generate the greeting itself.
     if use_cached_greeting:
         initial_messages = [{"role": "assistant", "content": greeting_audio.GREETING_TEXT}]
     else:
@@ -321,7 +416,7 @@ async def run_bot(
 
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=_build_user_params(),
+        user_params=user_params,
     )
 
     # Audio recording processor — captures both user and bot audio
@@ -331,7 +426,7 @@ async def run_bot(
         [
             transport.input(),
             user_aggregator,
-            llm,
+            *voice_services,
             transport.output(),
             audiobuffer,
             assistant_aggregator,
