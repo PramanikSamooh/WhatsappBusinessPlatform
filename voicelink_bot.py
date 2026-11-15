@@ -255,7 +255,7 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
     )
 
     # Same engine and voice as WhatsApp calls (VOICE_ENGINE: gemini or sarvam).
-    voice_services, llm, user_params = build_voice_services(
+    listen, respond, llm, user_params = build_voice_services(
         _build_system_prompt(
             outbound, knowledge_context, caller_name, purpose, (campaign or {}).get("brief", "")
         )
@@ -280,8 +280,9 @@ async def run_voicelink_bot(websocket, start: StartEvent, start_raw: str):
     pipeline = Pipeline(
         [
             transport.input(),
+            *listen,
             user_aggregator,
-            *voice_services,
+            *respond,
             transport.output(),
             audiobuffer,
             assistant_aggregator,

@@ -229,10 +229,13 @@ logger.info(
 def build_voice_services(system_instruction: str, greet_on_connect: bool = True):
     """Build the speech/LLM services for a call on the configured VOICE_ENGINE.
 
-    Returns (services, llm, user_params): ``services`` sit between the user and
-    assistant aggregators in the pipeline, and ``llm`` is where the call's
-    function tools (end_call, transfer_call) are registered. Used by both
-    WhatsApp calls (this file) and phone calls (voicelink_bot.py).
+    Returns (listen, respond, llm, user_params): ``listen`` goes between the
+    transport input and the user aggregator (speech-to-text must run before the
+    aggregator, which collects its transcripts into the conversation);
+    ``respond`` goes between the user aggregator and the transport output; and
+    ``llm`` is where the call's function tools (end_call, transfer_call) are
+    registered. Used by both WhatsApp calls (this file) and phone calls
+    (voicelink_bot.py).
     """
     if VOICE_ENGINE != "sarvam":
         llm = GeminiLiveLLMService(
@@ -242,7 +245,7 @@ def build_voice_services(system_instruction: str, greet_on_connect: bool = True)
             params=_build_gemini_params(),
             inference_on_context_initialization=greet_on_connect,
         )
-        return [llm], llm, _build_user_params()
+        return [], [llm], llm, _build_user_params()
 
     from pipecat.services.sarvam.llm import SarvamLLMService
     from pipecat.services.sarvam.stt import SarvamRealtimeSTTService
@@ -284,7 +287,7 @@ def build_voice_services(system_instruction: str, greet_on_connect: bool = True)
         )
     )
     # No user_turn_strategies: the aggregator adopts the ones Saaras recommends.
-    return [stt, llm, tts], llm, LLMUserAggregatorParams(vad_analyzer=vad)
+    return [stt], [llm, tts], llm, LLMUserAggregatorParams(vad_analyzer=vad)
 
 
 # Hardcoded fallback — only used if knowledge/prompt_voice.md is missing
@@ -393,7 +396,7 @@ async def run_bot(
     greeting_pcm, greeting_rate = await greeting_audio.get_greeting_pcm()
     use_cached_greeting = greeting_pcm is not None
 
-    voice_services, llm, user_params = build_voice_services(
+    listen, respond, llm, user_params = build_voice_services(
         system_instruction,
         # When we play our own greeting clip, don't let Gemini also greet on
         # connect — it would double up. Gemini speaks once the caller does.
@@ -425,8 +428,9 @@ async def run_bot(
     pipeline = Pipeline(
         [
             transport.input(),
+            *listen,
             user_aggregator,
-            *voice_services,
+            *respond,
             transport.output(),
             audiobuffer,
             assistant_aggregator,
