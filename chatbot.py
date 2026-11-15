@@ -110,8 +110,9 @@ async def handle_text_message(
         except Exception as e:
             logger.error(f"Room lookup failed: {e}")
 
-    # 6. Call GPT-4o
-    reply_text = await _call_gpt4o(augmented_knowledge, recent_messages)
+    # 6. Call GPT-4o (pass campaign context if this thread started from an ERP message)
+    campaign = conversation.get("campaign", "")
+    reply_text = await _call_gpt4o(augmented_knowledge, recent_messages, campaign)
 
     # 7. Store assistant reply
     await add_message(conv_id, "assistant", reply_text, direction="outbound", source="ai")
@@ -160,8 +161,14 @@ async def handle_text_message(
     await update_conversation(conv_id, **update_fields)
 
 
-async def _call_gpt4o(knowledge_context: str, messages: list[dict]) -> str:
-    """Call GPT-4o with conversation history and return the reply."""
+async def _call_gpt4o(knowledge_context: str, messages: list[dict], campaign: str = "") -> str:
+    """Call GPT-4o with conversation history and return the reply.
+
+    If `campaign` is set, the conversation was started by an outbound message
+    our system sent on behalf of the ERP (e.g. a birthday greeting). We tell
+    the model so it replies in context instead of falling back to the generic
+    admissions line.
+    """
     if not OPENAI_API_KEY:
         logger.error("OPENAI_API_KEY not set")
         return FALLBACK_MESSAGE
@@ -171,6 +178,16 @@ async def _call_gpt4o(knowledge_context: str, messages: list[dict]) -> str:
         knowledge=knowledge_context or "No knowledge documents loaded yet.",
         support_phone=SUPPORT_PHONE,
     )
+
+    if campaign:
+        readable = campaign.replace("_", " ").strip()
+        system_prompt += (
+            f"\n\nRECENT CONTEXT: We just sent this person a '{readable}' message, "
+            "and their incoming message is most likely a reply to it. Acknowledge it "
+            "warmly and naturally in that context (e.g. thank them, respond to their "
+            "sentiment). Do NOT pivot to generic course or admissions information "
+            "unless they explicitly ask about it."
+        )
 
     openai_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages:
