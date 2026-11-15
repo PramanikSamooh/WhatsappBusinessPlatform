@@ -1,4 +1,5 @@
-pipecat-ai[google,silero,webrtc]>=0.0.102,<1.0
+pipecat-ai[google,sarvam,silero,webrtc,websocket]>=1.7.0,<2.0
+voicelink[pipecat]>=0.1.1,<0.2
 fastapi>=0.115.0,<1.0
 uvicorn>=0.32.0,<1.0
 python-dotenv>=1.0.0,<2.0
@@ -11,3 +12,4 @@ python-multipart>=0.0.9,<1.0
 openpyxl>=3.1.0,<4.0
 google-auth>=2.0.0,<3.0
 google-api-python-client>=2.0.0,<3.0
+pywebpush>=2.0.0,<3.0

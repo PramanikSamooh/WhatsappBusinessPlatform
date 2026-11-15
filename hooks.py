@@ -24,6 +24,8 @@ async def send_call_summary(call_data: dict):
     payload = {
         "event": "call_ended",
         "call_id": call_data.get("call_id", ""),
+        "channel": call_data.get("channel", "whatsapp"),  # "whatsapp" | "phone"
+        "direction": call_data.get("direction", "inbound"),
         "caller": {
             "phone": call_data.get("caller_phone", ""),
             "name": call_data.get("caller_name", ""),

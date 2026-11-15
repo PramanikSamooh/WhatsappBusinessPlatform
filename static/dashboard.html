@@ -43,6 +43,25 @@
         @media (max-width: 767px) {
             .inbox-list-panel, .inbox-thread-panel { width: 100% !important; }
             .hidden-mobile { display: none !important; }
+            /* Conversation-LIST view fills the screen above the bottom nav. */
+            #inbox-container {
+                height: calc(100dvh - var(--inbox-top, 120px) - 72px) !important;
+                min-height: 0 !important;
+            }
+            /* Open THREAD view = full-screen overlay. height/top are set in JS from
+               window.visualViewport so the reply box stays above the keyboard. */
+            #inbox-thread-wrapper.thread-fs {
+                position: fixed !important;
+                left: 0;
+                width: 100% !important;
+                z-index: 60;
+                background: #fff;
+                border: 0;
+                border-radius: 0;
+            }
+            #inbox-thread-wrapper.thread-fs #inbox-messages { overscroll-behavior: contain; }
+            /* Hide the bottom nav while a thread is open so it can't overlap the input. */
+            body.thread-open .bottom-nav { display: none !important; }
         }
         @media (max-width: 767px) { .modal-content { width: 100% !important; max-width: 100% !important; height: 100% !important; max-height: 100% !important; border-radius: 0 !important; margin: 0 !important; } }
         @media (max-width: 767px) { .touch-target { min-height: 44px; min-width: 44px; } }
@@ -176,7 +195,7 @@
 
         <!-- Inbox Panel (two-panel layout) -->
         <div id="panel-inbox" class="max-w-7xl mx-auto px-4 mt-3 hidden main-content-pad">
-            <div class="bg-white rounded-lg shadow-sm border flex" style="height: calc(100vh - 320px); min-height: 450px;">
+            <div id="inbox-container" class="bg-white rounded-lg shadow-sm border flex" style="height: calc(100vh - 320px); min-height: 450px;">
                 <!-- Left: Conversation List -->
                 <div id="inbox-list-wrapper" class="w-full md:w-80 border-r flex flex-col inbox-list-panel">
                     <div class="p-3 border-b">
@@ -206,9 +225,10 @@
                     <div id="inbox-messages" class="flex-1 overflow-y-auto p-4 space-y-2">
                         <p class="text-center text-sm text-gray-400 mt-20">Select a conversation to view messages</p>
                     </div>
-                    <div id="inbox-reply-bar" class="p-3 border-t hidden">
+                    <div id="inbox-reply-bar" class="p-3 border-t hidden" style="padding-bottom: max(0.75rem, env(safe-area-inset-bottom));">
                         <form onsubmit="sendInboxReply(event)" class="flex gap-2">
                             <input id="inbox-reply-input" type="text" placeholder="Type a reply..."
+                                onfocus="setTimeout(scrollInboxToBottom, 300)"
                                 class="flex-1 border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
                             <button type="button" onclick="showInteractiveModal()" class="bg-indigo-500 text-white px-2 md:px-3 py-2 rounded text-sm font-medium hover:bg-indigo-600" title="Send interactive message">
                                 <span class="hidden md:inline">Buttons</span>
@@ -311,6 +331,51 @@
 
         <!-- Campaigns Panel -->
         <div id="panel-campaigns" class="max-w-7xl mx-auto px-4 mt-3 hidden main-content-pad">
+            <!-- WhatsApp | AI Calls switch -->
+            <div class="inline-flex gap-1 mb-3 bg-gray-100 rounded-lg p-1">
+                <button id="camp-mode-whatsapp" onclick="setCampaignMode('whatsapp')" class="text-sm px-3 py-1 rounded-md bg-white shadow-sm font-medium text-gray-800">WhatsApp</button>
+                <button id="camp-mode-calls" onclick="setCampaignMode('calls')" class="text-sm px-3 py-1 rounded-md text-gray-500">AI Calls</button>
+            </div>
+
+            <!-- AI Call Campaigns (VoiceLink outbound) -->
+            <div id="call-campaigns-view" class="hidden">
+                <div class="flex flex-wrap gap-3 mb-3 items-center">
+                    <select id="call-campaigns-status-filter" onchange="loadCallCampaigns()" class="text-sm border rounded px-2 py-1.5">
+                        <option value="">All Status</option>
+                        <option value="draft">Draft</option>
+                        <option value="running">Running</option>
+                        <option value="paused">Paused</option>
+                        <option value="completed">Completed</option>
+                        <option value="failed">Failed</option>
+                    </select>
+                    <span class="text-xs text-gray-400">The AI calls each person one by one, within call hours.</span>
+                    <div class="ml-auto">
+                        <button onclick="showCallCampaignModal()" class="text-sm bg-blue-500 text-white px-3 py-1.5 rounded hover:bg-blue-600">+ New Call Campaign</button>
+                    </div>
+                </div>
+                <div class="bg-white rounded-lg shadow-sm border overflow-x-auto desktop-table">
+                    <table class="w-full text-sm">
+                        <thead class="bg-gray-50 border-b">
+                            <tr>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">Name</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">Purpose</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">Status</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">People</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">Talked</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">No answer</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">Pending</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">Created</th>
+                                <th class="text-left px-4 py-2 font-medium text-gray-600">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="call-campaigns-body"></tbody>
+                    </table>
+                    <div id="call-campaigns-empty" class="hidden text-center py-8 text-gray-400">No call campaigns yet</div>
+                </div>
+                <div id="call-campaigns-cards" class="mobile-cards"></div>
+            </div>
+
+            <div id="whatsapp-campaigns-view">
             <!-- Campaign Actions Bar -->
             <div class="flex flex-wrap gap-3 mb-3 items-center">
                 <select id="campaigns-status-filter" onchange="loadCampaigns()" class="text-sm border rounded px-2 py-1.5">
@@ -347,6 +412,7 @@
                 <div id="campaigns-empty" class="hidden text-center py-8 text-gray-400">No campaigns found</div>
             </div>
             <div id="campaigns-cards" class="mobile-cards"></div>
+            </div>
         </div>
 
         <!-- Orders Panel -->
@@ -664,6 +730,135 @@
             </div>
         </div>
 
+        <!-- Create / Edit AI Call Campaign Modal -->
+        <div id="call-campaign-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div class="bg-white rounded-lg shadow-xl p-6 w-full max-w-2xl mx-4 max-h-[90vh] overflow-y-auto modal-content">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 id="ccm-title" class="text-lg font-bold text-gray-900">New AI Call Campaign</h3>
+                    <button onclick="closeCallCampaignModal()" class="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+                </div>
+                <div class="space-y-3">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-500 mb-1">Campaign Name</label>
+                        <input id="ccm-name" type="text" placeholder="e.g. Alumni Meet Nov 2026" class="w-full border rounded px-3 py-1.5 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-500 mb-1">Purpose of the call <span class="text-gray-400">(the AI opens with this)</span></label>
+                        <input id="ccm-purpose" type="text" placeholder="e.g. invite them to the IFS alumni meet on 15 November" class="w-full border rounded px-3 py-1.5 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-500 mb-1">Brief for the AI <span class="text-gray-400">(details it can share and answer from)</span></label>
+                        <textarea id="ccm-brief" rows="6" placeholder="Date & time: ...&#10;Venue: ...&#10;Agenda: ...&#10;Fee / how to register: ...&#10;Common questions and answers: ..." class="w-full border rounded px-3 py-1.5 text-sm"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-500 mb-1">WhatsApp follow-up after the call <span class="text-gray-400">(optional approved template; {{1}} = name)</span></label>
+                        <select id="ccm-followup" class="w-full border rounded px-3 py-1.5 text-sm"><option value="">Default follow-up</option></select>
+                    </div>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-500 mb-1">Call from (IST)</label>
+                            <input id="ccm-window-start" type="time" value="10:00" class="w-full border rounded px-2 py-1.5 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-500 mb-1">Call until (IST)</label>
+                            <input id="ccm-window-end" type="time" value="19:00" class="w-full border rounded px-2 py-1.5 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-500 mb-1">Attempts per person</label>
+                            <input id="ccm-attempts" type="number" min="1" max="5" value="2" class="w-full border rounded px-2 py-1.5 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-500 mb-1">Retry after (min)</label>
+                            <input id="ccm-retry-gap" type="number" min="5" max="1440" value="60" class="w-full border rounded px-2 py-1.5 text-sm">
+                        </div>
+                    </div>
+                    <p id="ccm-error" class="hidden text-sm text-red-600"></p>
+                </div>
+                <div class="flex justify-end gap-2 mt-5">
+                    <button onclick="closeCallCampaignModal()" class="text-sm bg-gray-200 text-gray-700 px-4 py-2 rounded hover:bg-gray-300">Cancel</button>
+                    <button onclick="saveCallCampaign()" class="text-sm bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Save</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- AI Call Campaign Detail Modal -->
+        <div id="call-campaign-detail-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div class="bg-white rounded-lg shadow-xl p-6 w-full max-w-4xl mx-4 max-h-[90vh] overflow-y-auto modal-content">
+                <div class="flex items-start justify-between mb-3">
+                    <div>
+                        <h3 id="ccd-title" class="text-lg font-bold text-gray-900">Call Campaign</h3>
+                        <p id="ccd-purpose" class="text-sm text-gray-600 mt-0.5"></p>
+                        <p id="ccd-meta" class="text-xs text-gray-400 mt-0.5"></p>
+                    </div>
+                    <button onclick="closeCallCampaignDetail()" class="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+                </div>
+                <p id="ccd-error" class="hidden mb-3 text-sm bg-red-50 text-red-700 border border-red-200 rounded p-2"></p>
+                <div class="grid grid-cols-3 md:grid-cols-6 gap-2 mb-4">
+                    <div class="bg-gray-50 rounded p-2 text-center"><p class="text-xs text-gray-500">People</p><p id="ccd-total" class="text-lg font-bold">-</p></div>
+                    <div class="bg-green-50 rounded p-2 text-center"><p class="text-xs text-gray-500">Talked</p><p id="ccd-completed" class="text-lg font-bold text-green-600">-</p></div>
+                    <div class="bg-orange-50 rounded p-2 text-center"><p class="text-xs text-gray-500">Handoff</p><p id="ccd-handoff" class="text-lg font-bold text-orange-600">-</p></div>
+                    <div class="bg-yellow-50 rounded p-2 text-center"><p class="text-xs text-gray-500">No answer / busy</p><p id="ccd-noanswer" class="text-lg font-bold text-yellow-600">-</p></div>
+                    <div class="bg-red-50 rounded p-2 text-center"><p class="text-xs text-gray-500">Failed</p><p id="ccd-failed" class="text-lg font-bold text-red-600">-</p></div>
+                    <div class="bg-blue-50 rounded p-2 text-center"><p class="text-xs text-gray-500">Pending</p><p id="ccd-pending" class="text-lg font-bold text-blue-600">-</p></div>
+                </div>
+                <div class="flex flex-wrap gap-2 mb-4">
+                    <button id="ccd-start-btn" onclick="startCallCampaign()" class="hidden text-sm bg-green-500 text-white px-3 py-1.5 rounded hover:bg-green-600">Start Calling</button>
+                    <button id="ccd-pause-btn" onclick="pauseCallCampaign()" class="hidden text-sm bg-yellow-500 text-white px-3 py-1.5 rounded hover:bg-yellow-600">Pause</button>
+                    <button onclick="editCallCampaign()" class="text-sm bg-gray-200 text-gray-700 px-3 py-1.5 rounded hover:bg-gray-300">Edit</button>
+                    <button onclick="showCallRecipientUpload()" class="text-sm bg-blue-500 text-white px-3 py-1.5 rounded hover:bg-blue-600">Upload CSV</button>
+                    <button onclick="showCallRecipientsFromContacts()" class="text-sm bg-indigo-500 text-white px-3 py-1.5 rounded hover:bg-indigo-600">Add from CRM</button>
+                    <button onclick="exportCallCampaignResults()" class="text-sm bg-gray-200 text-gray-700 px-3 py-1.5 rounded hover:bg-gray-300">Export Results</button>
+                    <button id="ccd-delete-btn" onclick="deleteCallCampaign()" class="text-sm bg-red-100 text-red-700 px-3 py-1.5 rounded hover:bg-red-200">Delete</button>
+                </div>
+                <div id="ccd-upload-area" class="hidden mb-4 p-3 bg-gray-50 rounded border">
+                    <p class="text-xs text-gray-500 mb-2">CSV with a <code>phone</code> column and optional <code>name</code> column. Indian numbers, 10-digit or with 91.</p>
+                    <input id="ccd-upload-file" type="file" accept=".csv" onchange="previewCallRecipients()" class="text-sm mb-2">
+                    <div id="ccd-upload-preview" class="hidden text-xs mb-2"></div>
+                    <button id="ccd-upload-confirm" onclick="confirmCallRecipients()" disabled class="text-sm bg-green-500 text-white px-3 py-1 rounded hover:bg-green-600 disabled:opacity-50">Add</button>
+                    <span id="ccd-upload-result" class="text-sm ml-2"></span>
+                </div>
+                <div id="ccd-contacts-area" class="hidden mb-4 p-3 bg-indigo-50 rounded border border-indigo-200">
+                    <p class="text-xs font-medium text-indigo-700 mb-2">Add people from CRM contacts</p>
+                    <div class="flex flex-wrap gap-2 items-end">
+                        <div>
+                            <label class="block text-xs text-indigo-600 mb-1">Stage</label>
+                            <select id="ccd-contact-stage" class="text-sm border rounded px-2 py-1">
+                                <option value="">All stages</option>
+                                <option value="new">New</option>
+                                <option value="contacted">Contacted</option>
+                                <option value="interested">Interested</option>
+                                <option value="enrolled">Enrolled</option>
+                                <option value="lost">Lost</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-indigo-600 mb-1">Tags (comma separated)</label>
+                            <input id="ccd-contact-tags" type="text" placeholder="e.g. alumni" class="text-sm border rounded px-2 py-1 w-40">
+                        </div>
+                        <button onclick="addCallRecipientsFromContacts()" class="text-sm bg-indigo-500 text-white px-3 py-1 rounded hover:bg-indigo-600">Add Contacts</button>
+                        <span id="ccd-contacts-result" class="text-sm ml-2"></span>
+                    </div>
+                </div>
+                <div class="bg-white border rounded overflow-x-auto max-h-80 overflow-y-auto">
+                    <table class="w-full text-xs">
+                        <thead class="bg-gray-50 border-b sticky top-0">
+                            <tr>
+                                <th class="text-left px-3 py-1 font-medium text-gray-600">Phone</th>
+                                <th class="text-left px-3 py-1 font-medium text-gray-600">Name</th>
+                                <th class="text-left px-3 py-1 font-medium text-gray-600">Status</th>
+                                <th class="text-left px-3 py-1 font-medium text-gray-600">Attempts</th>
+                                <th class="text-left px-3 py-1 font-medium text-gray-600">Last attempt</th>
+                                <th class="text-left px-3 py-1 font-medium text-gray-600">Duration</th>
+                                <th class="text-left px-3 py-1 font-medium text-gray-600">Note</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ccd-recipients-body"></tbody>
+                    </table>
+                </div>
+                <p class="text-xs text-gray-400 mt-2">Answered calls appear in the Calls tab with transcript and recording.</p>
+            </div>
+        </div>
+
         <!-- Quick Message Modal (from Calls/Contacts) -->
         <div id="quick-msg-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
             <div class="bg-white rounded-lg shadow-xl p-6 w-full max-w-md mx-4 modal-content overflow-y-auto">
@@ -863,6 +1058,56 @@
         navigator.serviceWorker.register('/service-worker.js').catch(() => {});
     }
 
+    // --- Web Push notifications ---
+    function urlBase64ToUint8Array(base64String) {
+        const padding = '='.repeat((4 - base64String.length % 4) % 4);
+        const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+        const raw = atob(base64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        return arr;
+    }
+
+    let _pushSetupDone = false;
+    async function setupPush() {
+        if (_pushSetupDone) return;
+        if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return;
+        try {
+            const res = await authFetch('/api/push/vapid-public-key');
+            const { enabled, publicKey } = await res.json();
+            if (!enabled || !publicKey) return;  // push not configured server-side
+
+            let perm = Notification.permission;
+            if (perm === 'default') perm = await Notification.requestPermission();
+            if (perm !== 'granted') return;
+
+            const reg = await navigator.serviceWorker.ready;
+            let sub = await reg.pushManager.getSubscription();
+            if (!sub) {
+                sub = await reg.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey: urlBase64ToUint8Array(publicKey),
+                });
+            }
+            await authFetch('/api/push/subscribe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(sub),
+            });
+            _pushSetupDone = true;
+        } catch (e) {
+            console.warn('Push setup failed:', e);
+        }
+    }
+
+    // The permission prompt needs a user gesture in some browsers — if it's still
+    // undecided, retry on the next click.
+    function armPushGestureFallback() {
+        if (!('Notification' in window) || Notification.permission !== 'default') return;
+        const handler = () => { document.removeEventListener('click', handler); setupPush(); };
+        document.addEventListener('click', handler, { once: true });
+    }
+
     // --- Auth ---
 
     async function checkAuth() {
@@ -891,6 +1136,8 @@
         document.getElementById('dashboard-screen').classList.remove('hidden');
         refreshAll();
         autoRefreshInterval = setInterval(refreshAll, 30000);
+        setupPush();
+        armPushGestureFallback();
     }
 
     async function handleLogin(e) {
@@ -974,7 +1221,7 @@
         if (tab === 'inbox') { loadInbox(); startInboxPoll(); resetInboxMobileView(); }
         else { stopInboxPoll(); }
         if (tab === 'contacts') { loadContacts(); loadContactStats(); }
-        if (tab === 'campaigns') loadCampaigns();
+        if (tab === 'campaigns') { if (campaignMode === 'calls') loadCallCampaigns(); else loadCampaigns(); }
         if (tab === 'orders') { loadOrders(); loadOrderStats(); }
         if (tab === 'knowledge') resetKnowledgeMobileView();
     }
@@ -990,17 +1237,62 @@
     }
 
     // --- Inbox mobile split view ---
+    // On mobile the open thread becomes a full-screen overlay whose size tracks the
+    // VisualViewport, so the reply box always sits just above the on-screen keyboard.
+    let _vvHandler = null;
+
+    function _applyThreadViewport() {
+        const wrapper = document.getElementById('inbox-thread-wrapper');
+        const vv = window.visualViewport;
+        const h = vv ? vv.height : window.innerHeight;
+        const t = vv ? vv.offsetTop : 0;
+        wrapper.style.height = h + 'px';
+        wrapper.style.top = t + 'px';
+    }
+
+    function enterMobileThread() {
+        if (!isMobile()) return;
+        const wrapper = document.getElementById('inbox-thread-wrapper');
+        wrapper.classList.add('thread-fs');
+        document.body.classList.add('thread-open');
+        _applyThreadViewport();
+        if (!_vvHandler) {
+            _vvHandler = _applyThreadViewport;
+            if (window.visualViewport) {
+                window.visualViewport.addEventListener('resize', _vvHandler);
+                window.visualViewport.addEventListener('scroll', _vvHandler);
+            }
+        }
+        setTimeout(scrollInboxToBottom, 100);
+    }
+
+    function exitMobileThread() {
+        const wrapper = document.getElementById('inbox-thread-wrapper');
+        wrapper.classList.remove('thread-fs');
+        wrapper.style.height = '';
+        wrapper.style.top = '';
+        document.body.classList.remove('thread-open');
+        if (_vvHandler && window.visualViewport) {
+            window.visualViewport.removeEventListener('resize', _vvHandler);
+            window.visualViewport.removeEventListener('scroll', _vvHandler);
+        }
+        _vvHandler = null;
+    }
+
     function showInboxThread() {
         if (!isMobile()) return;
         document.getElementById('inbox-list-wrapper').classList.add('hidden-mobile');
         document.getElementById('inbox-thread-wrapper').classList.remove('hidden-mobile');
+        enterMobileThread();
     }
     function showInboxList() {
         if (!isMobile()) return;
+        exitMobileThread();
         document.getElementById('inbox-thread-wrapper').classList.add('hidden-mobile');
         document.getElementById('inbox-list-wrapper').classList.remove('hidden-mobile');
     }
     function resetInboxMobileView() {
+        exitMobileThread();
         if (isMobile()) {
             document.getElementById('inbox-list-wrapper').classList.remove('hidden-mobile');
             document.getElementById('inbox-thread-wrapper').classList.add('hidden-mobile');
@@ -1008,6 +1300,22 @@
             document.getElementById('inbox-list-wrapper').classList.remove('hidden-mobile');
             document.getElementById('inbox-thread-wrapper').classList.remove('hidden-mobile');
         }
+        adjustInboxHeight();
+    }
+
+    // List-view height: fill the screen above the bottom nav (no keyboard concerns).
+    function adjustInboxHeight() {
+        const container = document.getElementById('inbox-container');
+        if (!container || !isMobile() || currentTab !== 'inbox') return;
+        requestAnimationFrame(() => {
+            const top = container.getBoundingClientRect().top;
+            if (top > 0) document.documentElement.style.setProperty('--inbox-top', Math.round(top) + 'px');
+        });
+    }
+
+    function scrollInboxToBottom() {
+        const msgs = document.getElementById('inbox-messages');
+        if (msgs) msgs.scrollTop = msgs.scrollHeight;
     }
 
     // --- Knowledge mobile split view ---
@@ -1031,11 +1339,21 @@
         }
     }
 
-    // Reset panels when resizing across breakpoint
+    // Reset panels only when the WIDTH breakpoint actually changes — NOT on every
+    // resize. The soft keyboard fires a resize (height change); resetting there would
+    // kick the user out of the open thread the moment they focus the reply box.
+    let _lastIsMobile = isMobile();
+    let _lastWidth = window.innerWidth;
     window.addEventListener('resize', () => {
-        if (currentTab === 'inbox') resetInboxMobileView();
-        if (currentTab === 'knowledge') resetKnowledgeMobileView();
-        // Re-evaluate stats visibility on resize
+        const widthChanged = window.innerWidth !== _lastWidth;
+        const breakpointChanged = isMobile() !== _lastIsMobile;
+        _lastWidth = window.innerWidth;
+        _lastIsMobile = isMobile();
+        // Only a genuine layout/orientation change should reset the split views.
+        if (widthChanged || breakpointChanged) {
+            if (currentTab === 'inbox') resetInboxMobileView();
+            if (currentTab === 'knowledge') resetKnowledgeMobileView();
+        }
         const stats = document.getElementById('stats-section');
         if (stats) stats.classList.toggle('stats-hidden', currentTab !== 'calls' && isMobile());
     });
@@ -1050,6 +1368,13 @@
     function stageBadge(stage) {
         const cls = { 'new': 'badge-new', 'contacted': 'badge-contacted', 'interested': 'badge-interested', 'enrolled': 'badge-enrolled', 'lost': 'badge-lost', 'blocked': 'badge-blocked' }[stage] || 'badge-new';
         return `<span class="badge ${cls}">${stage || 'new'}</span>`;
+    }
+
+    // Phone calls (VoiceLink) share the calls list with WhatsApp calls; WhatsApp gets no badge.
+    function channelBadge(c) {
+        if (c.channel !== 'phone') return '';
+        const label = c.direction === 'outbound' ? 'Phone · Outbound' : 'Phone';
+        return ` <span class="badge bg-indigo-100 text-indigo-700">${label}</span>`;
     }
 
     function topicBadges(topics) {
@@ -1277,7 +1602,7 @@
                     <tr class="border-b hover:bg-gray-50 cursor-pointer" onclick="toggleTranscript('call-${safeId}')">
                         <td class="px-2 py-2" onclick="event.stopPropagation()"><input type="checkbox" onchange="toggleCallSelect('${safeId}', this.checked)" class="call-select-cb"></td>
                         <td class="px-4 py-2">${escapeHtml(c.caller_name || '-')}</td>
-                        <td class="px-4 py-2 font-mono text-xs">${escapeHtml(c.caller_phone || '-')}</td>
+                        <td class="px-4 py-2 font-mono text-xs">${escapeHtml(c.caller_phone || '-')}${channelBadge(c)}</td>
                         <td class="px-4 py-2">${formatDuration(c.duration_seconds)}</td>
                         <td class="px-4 py-2">${statusBadge(c.status)}</td>
                         <td class="px-4 py-2">${topicBadges(c.topics)}</td>
@@ -1311,7 +1636,7 @@
                             ${statusBadge(c.status)}
                         </div>
                         <div class="flex items-center justify-between text-xs text-gray-500 mb-2">
-                            <span class="font-mono">${escapeHtml(c.caller_phone || '-')}</span>
+                            <span class="font-mono">${escapeHtml(c.caller_phone || '-')}${channelBadge(c)}</span>
                             <span>${formatDuration(c.duration_seconds)} &middot; ${formatTime(c.connected_at || c.created_at)}</span>
                         </div>
                         <div class="mb-2">${topicBadges(c.topics)}</div>
@@ -1399,7 +1724,7 @@
                 const isActive = selectedConvId === c.id;
                 const lastMsg = c.last_message;
                 const preview = lastMsg ? (lastMsg.content || '').substring(0, 50) : 'No messages';
-                const sourceIcon = lastMsg && lastMsg.source === 'manual' ? '(You)' : lastMsg && lastMsg.role === 'assistant' ? '(AI)' : '';
+                const sourceIcon = lastMsg && lastMsg.source === 'manual' ? '(You)' : lastMsg && lastMsg.source === 'erp' ? '(ERP)' : lastMsg && lastMsg.role === 'assistant' ? '(AI)' : '';
                 const isHandoff = c.status === 'handoff_pending';
                 const safeId = escapeHtml(c.id);
                 const safeContactId = escapeHtml(c.contact_id || '');
@@ -1461,7 +1786,7 @@
                 const isUser = m.role === 'user';
                 const align = isUser ? 'items-end' : 'items-start';
                 const bgClass = isUser ? 'msg-user' : 'msg-assistant';
-                const sourceLabel = m.source === 'manual' ? 'You' : m.source === 'ai' ? 'AI' : m.source === 'system' ? 'System' : '';
+                const sourceLabel = m.source === 'manual' ? 'You' : m.source === 'ai' ? 'AI' : m.source === 'erp' ? 'ERP' : m.source === 'system' ? 'System' : '';
                 // Render inline media if available
                 let mediaHtml = '';
                 if (m.media_url && m.msg_type) {
@@ -1775,6 +2100,7 @@
                         <td class="px-4 py-2 text-xs text-gray-500">${formatTime(c.last_seen)}</td>
                         <td class="px-4 py-2">
                             <button onclick="editContact('${safeId}')" class="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded hover:bg-blue-200">Edit</button>
+                            ${c.phone ? `<button onclick="callWithAI(this)" data-phone="${escapeAttr(c.phone)}" data-name="${escapeAttr(c.name || '')}" class="text-xs bg-indigo-100 text-indigo-700 px-2 py-1 rounded hover:bg-indigo-200" title="Have the AI phone this contact">AI Call</button>` : ''}
                         </td>
                     </tr>`;
             }).join('');
@@ -1800,6 +2126,7 @@
                         <div class="flex items-center justify-between">
                             <span class="text-xs text-gray-400">${formatTime(c.last_seen)}</span>
                             <button onclick="editContact('${safeId}')" class="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">Edit</button>
+                            ${c.phone ? `<button onclick="callWithAI(this)" data-phone="${escapeAttr(c.phone)}" data-name="${escapeAttr(c.name || '')}" class="text-xs bg-indigo-100 text-indigo-700 px-2 py-1 rounded">AI Call</button>` : ''}
                         </div>
                     </div>`;
                 }).join('');
@@ -2410,6 +2737,372 @@
     async function quickPauseCampaign(id) {
         try { await authFetch(`/api/campaigns/${id}/pause`, { method: 'POST' }); loadCampaigns(); }
         catch (e) { if (e.message !== 'Unauthorized') alert('Failed: ' + e.message); }
+    }
+
+    // --- AI Call Campaigns (VoiceLink outbound) ---
+
+    var campaignMode = 'whatsapp';      // 'whatsapp' | 'calls' (var: read by switchTab)
+    let currentCallCampaignId = null;
+    let editingCallCampaignId = null;
+    let callRecipientRecords = [];
+    let callCampaignRefreshTimer = null;
+
+    // escapeHtml leaves quotes alone; attributes need them escaped too.
+    function escapeAttr(text) {
+        return escapeHtml(String(text ?? '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function setCampaignMode(mode) {
+        campaignMode = mode;
+        const calls = mode === 'calls';
+        document.getElementById('call-campaigns-view').classList.toggle('hidden', !calls);
+        document.getElementById('whatsapp-campaigns-view').classList.toggle('hidden', calls);
+        const on = 'text-sm px-3 py-1 rounded-md bg-white shadow-sm font-medium text-gray-800';
+        const off = 'text-sm px-3 py-1 rounded-md text-gray-500';
+        document.getElementById('camp-mode-calls').className = calls ? on : off;
+        document.getElementById('camp-mode-whatsapp').className = calls ? off : on;
+        if (calls) loadCallCampaigns(); else loadCampaigns();
+    }
+
+    function callRecipientBadge(status) {
+        const cls = {
+            pending: 'bg-gray-100 text-gray-600', dialing: 'bg-blue-100 text-blue-700',
+            in_call: 'bg-indigo-100 text-indigo-700', completed: 'bg-green-100 text-green-700',
+            no_answer: 'bg-yellow-100 text-yellow-700', busy: 'bg-yellow-100 text-yellow-700',
+            failed: 'bg-red-100 text-red-700',
+        }[status] || 'bg-gray-100 text-gray-600';
+        const label = { in_call: 'in call', no_answer: 'no answer' }[status] || status;
+        return `<span class="badge ${cls}">${escapeHtml(label)}</span>`;
+    }
+
+    async function loadCallCampaigns() {
+        const status = document.getElementById('call-campaigns-status-filter').value;
+        try {
+            const res = await authFetch(`/api/call-campaigns${status ? '?status=' + encodeURIComponent(status) : ''}`);
+            const campaigns = (await res.json()).campaigns || [];
+            const tbody = document.getElementById('call-campaigns-body');
+            const cards = document.getElementById('call-campaigns-cards');
+            document.getElementById('call-campaigns-empty').classList.toggle('hidden', campaigns.length > 0);
+            const actions = c => {
+                const id = escapeAttr(c.id);
+                if (c.status === 'running') return `<button onclick="event.stopPropagation(); quickCallCampaign('${id}', 'pause')" class="text-xs bg-yellow-100 text-yellow-700 px-2 py-1 rounded hover:bg-yellow-200">Pause</button>`;
+                return `<button onclick="event.stopPropagation(); quickCallCampaign('${id}', 'start')" class="text-xs bg-green-100 text-green-700 px-2 py-1 rounded hover:bg-green-200">${c.status === 'draft' ? 'Start' : 'Resume'}</button>`;
+            };
+            tbody.innerHTML = campaigns.map(c => {
+                const s = c.recipient_stats || {};
+                return `
+                    <tr class="border-b hover:bg-gray-50 cursor-pointer" onclick="openCallCampaign('${escapeAttr(c.id)}')">
+                        <td class="px-4 py-2 font-medium">${escapeHtml(c.name)}</td>
+                        <td class="px-4 py-2 text-xs text-gray-600 max-w-xs truncate">${escapeHtml(c.purpose)}</td>
+                        <td class="px-4 py-2">${statusBadge(c.status)}</td>
+                        <td class="px-4 py-2">${s.total || 0}</td>
+                        <td class="px-4 py-2 text-green-600">${s.completed || 0}</td>
+                        <td class="px-4 py-2 text-yellow-600">${(s.no_answer || 0) + (s.busy || 0)}</td>
+                        <td class="px-4 py-2 text-blue-600">${s.pending || 0}</td>
+                        <td class="px-4 py-2 text-xs text-gray-500">${formatTime(c.created_at)}</td>
+                        <td class="px-4 py-2">${s.total ? actions(c) : ''}</td>
+                    </tr>`;
+            }).join('');
+            cards.innerHTML = campaigns.map(c => {
+                const s = c.recipient_stats || {};
+                return `
+                    <div class="mobile-card-item" onclick="openCallCampaign('${escapeAttr(c.id)}')">
+                        <div class="flex items-center justify-between mb-1">
+                            <span class="font-medium text-sm text-gray-800">${escapeHtml(c.name)}</span>
+                            ${statusBadge(c.status)}
+                        </div>
+                        <div class="text-xs text-gray-500 mb-2">${escapeHtml(c.purpose)}</div>
+                        <div class="flex items-center justify-between text-xs text-gray-500">
+                            <span>${s.total || 0} people &middot; ${s.completed || 0} talked &middot; ${s.pending || 0} pending</span>
+                            ${s.total ? actions(c) : ''}
+                        </div>
+                    </div>`;
+            }).join('');
+        } catch (e) { if (e.message !== 'Unauthorized') console.error('Call campaigns error:', e); }
+    }
+
+    async function quickCallCampaign(id, action) {
+        if (action === 'start' && !confirm('Start calling? The AI will phone each person one by one (uses VoiceLink balance).')) return;
+        try { await authFetch(`/api/call-campaigns/${id}/${action}`, { method: 'POST' }); }
+        catch (e) { if (e.message !== 'Unauthorized') alert('Failed: ' + e.message); }
+        setTimeout(loadCallCampaigns, 500);
+    }
+
+    async function loadFollowupTemplateOptions(selected) {
+        const select = document.getElementById('ccm-followup');
+        try {
+            if (!_templateCache.length) {
+                const tData = await (await authFetch('/api/templates')).json();
+                _templateCache = (tData.templates || []).filter(t => t.status === 'APPROVED');
+            }
+        } catch (e) { /* templates are optional */ }
+        select.innerHTML = '<option value="">Default follow-up</option>' + _templateCache.map(t =>
+            `<option value="${escapeAttr(t.name)}">${escapeHtml(t.name)}</option>`).join('');
+        select.value = selected || '';
+    }
+
+    function showCallCampaignModal(campaign) {
+        editingCallCampaignId = campaign ? campaign.id : null;
+        document.getElementById('ccm-title').textContent = campaign ? 'Edit AI Call Campaign' : 'New AI Call Campaign';
+        document.getElementById('ccm-name').value = campaign ? campaign.name : '';
+        document.getElementById('ccm-purpose').value = campaign ? campaign.purpose : '';
+        document.getElementById('ccm-brief').value = campaign ? (campaign.brief || '') : '';
+        document.getElementById('ccm-window-start').value = campaign ? campaign.call_window_start : '10:00';
+        document.getElementById('ccm-window-end').value = campaign ? campaign.call_window_end : '19:00';
+        document.getElementById('ccm-attempts').value = campaign ? campaign.max_attempts : 2;
+        document.getElementById('ccm-retry-gap').value = campaign ? campaign.retry_gap_minutes : 60;
+        document.getElementById('ccm-error').classList.add('hidden');
+        loadFollowupTemplateOptions(campaign ? campaign.followup_template : '');
+        document.getElementById('call-campaign-modal').classList.remove('hidden');
+    }
+
+    function closeCallCampaignModal() {
+        document.getElementById('call-campaign-modal').classList.add('hidden');
+        editingCallCampaignId = null;
+    }
+
+    async function saveCallCampaign() {
+        const body = {
+            name: document.getElementById('ccm-name').value.trim(),
+            purpose: document.getElementById('ccm-purpose').value.trim(),
+            brief: document.getElementById('ccm-brief').value.trim(),
+            followup_template: document.getElementById('ccm-followup').value,
+            call_window_start: document.getElementById('ccm-window-start').value,
+            call_window_end: document.getElementById('ccm-window-end').value,
+            max_attempts: parseInt(document.getElementById('ccm-attempts').value || '2', 10),
+            retry_gap_minutes: parseInt(document.getElementById('ccm-retry-gap').value || '60', 10),
+        };
+        const errEl = document.getElementById('ccm-error');
+        if (!body.name || !body.purpose) {
+            errEl.textContent = 'Name and purpose are required.';
+            errEl.classList.remove('hidden');
+            return;
+        }
+        try {
+            const editing = editingCallCampaignId;
+            const res = await authFetch(editing ? `/api/call-campaigns/${editing}` : '/api/call-campaigns', {
+                method: editing ? 'PATCH' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const saved = await res.json();
+            closeCallCampaignModal();
+            loadCallCampaigns();
+            openCallCampaign(saved.id);
+        } catch (e) {
+            if (e.message === 'Unauthorized') return;
+            errEl.textContent = 'Save failed: ' + e.message;
+            errEl.classList.remove('hidden');
+        }
+    }
+
+    async function openCallCampaign(id) {
+        currentCallCampaignId = id;
+        clearTimeout(callCampaignRefreshTimer);
+        try {
+            const c = await (await authFetch(`/api/call-campaigns/${id}`)).json();
+            if (currentCallCampaignId !== id) return;
+            const s = c.recipient_stats || {};
+            document.getElementById('ccd-title').textContent = c.name;
+            document.getElementById('ccd-purpose').textContent = 'Purpose: ' + c.purpose;
+            document.getElementById('ccd-meta').textContent =
+                `Status: ${c.status} · Calls ${c.call_window_start}–${c.call_window_end} IST · ` +
+                `${c.max_attempts} attempt(s), retry after ${c.retry_gap_minutes} min` +
+                (c.followup_template ? ` · WhatsApp follow-up: ${c.followup_template}` : '');
+            const errEl = document.getElementById('ccd-error');
+            errEl.textContent = c.last_error || '';
+            errEl.classList.toggle('hidden', !c.last_error);
+            document.getElementById('ccd-total').textContent = s.total || 0;
+            document.getElementById('ccd-completed').textContent = s.completed || 0;
+            document.getElementById('ccd-handoff').textContent = s.handoff || 0;
+            document.getElementById('ccd-noanswer').textContent = (s.no_answer || 0) + (s.busy || 0);
+            document.getElementById('ccd-failed').textContent = s.failed || 0;
+            document.getElementById('ccd-pending').textContent = (s.pending || 0) + (s.dialing || 0) + (s.in_call || 0);
+            const running = c.is_running;
+            document.getElementById('ccd-start-btn').classList.toggle('hidden', running || !s.total);
+            document.getElementById('ccd-start-btn').textContent = c.status === 'draft' ? 'Start Calling' : 'Resume Calling';
+            document.getElementById('ccd-pause-btn').classList.toggle('hidden', !running);
+            document.getElementById('ccd-delete-btn').classList.toggle('hidden', running);
+
+            const recipients = (await (await authFetch(`/api/call-campaigns/${id}/recipients?limit=500`)).json()).recipients || [];
+            document.getElementById('ccd-recipients-body').innerHTML = recipients.map(r => {
+                const note = [r.handoff_requested ? 'wants a callback' : '', r.hangup_reason, r.error_message]
+                    .filter(Boolean).join(' · ');
+                return `
+                    <tr class="border-b">
+                        <td class="px-3 py-1 font-mono">${escapeHtml(r.phone)}</td>
+                        <td class="px-3 py-1">${escapeHtml(r.name || '-')}</td>
+                        <td class="px-3 py-1">${callRecipientBadge(r.status)}</td>
+                        <td class="px-3 py-1">${r.attempts || 0}</td>
+                        <td class="px-3 py-1 text-gray-500">${r.last_attempt_at ? formatTime(r.last_attempt_at) : '-'}</td>
+                        <td class="px-3 py-1">${r.duration_seconds ? formatDuration(r.duration_seconds) : '-'}</td>
+                        <td class="px-3 py-1 text-gray-500">${escapeHtml(note)}</td>
+                    </tr>`;
+            }).join('') || '<tr><td colspan="7" class="px-3 py-4 text-center text-gray-400">No people yet. Upload a CSV or add from CRM.</td></tr>';
+
+            document.getElementById('call-campaign-detail-modal').classList.remove('hidden');
+            // Live progress while calling
+            if (running) callCampaignRefreshTimer = setTimeout(() => {
+                if (currentCallCampaignId === id) openCallCampaign(id);
+            }, 5000);
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Failed to load campaign: ' + e.message); }
+    }
+
+    function closeCallCampaignDetail() {
+        clearTimeout(callCampaignRefreshTimer);
+        document.getElementById('call-campaign-detail-modal').classList.add('hidden');
+        document.getElementById('ccd-upload-area').classList.add('hidden');
+        document.getElementById('ccd-contacts-area').classList.add('hidden');
+        currentCallCampaignId = null;
+        loadCallCampaigns();
+    }
+
+    async function editCallCampaign() {
+        if (!currentCallCampaignId) return;
+        try {
+            const c = await (await authFetch(`/api/call-campaigns/${currentCallCampaignId}`)).json();
+            closeCallCampaignDetail();
+            showCallCampaignModal(c);
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Failed: ' + e.message); }
+    }
+
+    async function startCallCampaign() {
+        if (!currentCallCampaignId || !confirm('Start calling? The AI will phone each person one by one (uses VoiceLink balance).')) return;
+        try {
+            await authFetch(`/api/call-campaigns/${currentCallCampaignId}/start`, { method: 'POST' });
+            setTimeout(() => openCallCampaign(currentCallCampaignId), 500);
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Failed to start: ' + e.message); }
+    }
+
+    async function pauseCallCampaign() {
+        if (!currentCallCampaignId) return;
+        try {
+            await authFetch(`/api/call-campaigns/${currentCallCampaignId}/pause`, { method: 'POST' });
+            alert('Pausing — the call in progress (if any) will finish first.');
+            openCallCampaign(currentCallCampaignId);
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Failed to pause: ' + e.message); }
+    }
+
+    async function deleteCallCampaign() {
+        if (!currentCallCampaignId || !confirm('Delete this call campaign and its list? Call records stay in the Calls tab.')) return;
+        try {
+            await authFetch(`/api/call-campaigns/${currentCallCampaignId}`, { method: 'DELETE' });
+            closeCallCampaignDetail();
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Failed to delete: ' + e.message); }
+    }
+
+    function showCallRecipientUpload() {
+        document.getElementById('ccd-upload-area').classList.remove('hidden');
+        document.getElementById('ccd-contacts-area').classList.add('hidden');
+        document.getElementById('ccd-upload-file').value = '';
+        document.getElementById('ccd-upload-preview').classList.add('hidden');
+        document.getElementById('ccd-upload-confirm').disabled = true;
+        document.getElementById('ccd-upload-result').textContent = '';
+        callRecipientRecords = [];
+    }
+
+    function previewCallRecipients() {
+        const file = document.getElementById('ccd-upload-file').files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const lines = e.target.result.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            if (lines.length < 2) { alert('CSV needs a header row and at least one person'); return; }
+            const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, '').toLowerCase());
+            const phoneIdx = headers.findIndex(h => ['phone', 'mobile', 'number', 'phone number', 'mobile number'].includes(h));
+            if (phoneIdx === -1) { alert('CSV must have a "phone" column'); return; }
+            const nameIdx = headers.indexOf('name');
+            callRecipientRecords = [];
+            for (let i = 1; i < lines.length; i++) {
+                const cols = lines[i].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+                if (!cols[phoneIdx]) continue;
+                callRecipientRecords.push({ phone: cols[phoneIdx], name: nameIdx >= 0 ? (cols[nameIdx] || '') : '' });
+            }
+            const preview = document.getElementById('ccd-upload-preview');
+            preview.textContent = `${callRecipientRecords.length} people found`;
+            preview.classList.remove('hidden');
+            document.getElementById('ccd-upload-confirm').disabled = !callRecipientRecords.length;
+        };
+        reader.readAsText(file);
+    }
+
+    async function confirmCallRecipients() {
+        if (!currentCallCampaignId || !callRecipientRecords.length) return;
+        document.getElementById('ccd-upload-confirm').disabled = true;
+        const resultEl = document.getElementById('ccd-upload-result');
+        try {
+            const data = await (await authFetch(`/api/call-campaigns/${currentCallCampaignId}/recipients`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ recipients: callRecipientRecords }),
+            })).json();
+            resultEl.textContent = `Added: ${data.added}, Duplicates: ${data.duplicate}, Invalid: ${data.invalid}`;
+            resultEl.className = 'text-sm ml-2 text-green-600';
+            openCallCampaign(currentCallCampaignId);
+        } catch (e) {
+            resultEl.textContent = 'Upload failed: ' + e.message;
+            resultEl.className = 'text-sm ml-2 text-red-600';
+        }
+    }
+
+    function showCallRecipientsFromContacts() {
+        document.getElementById('ccd-contacts-area').classList.remove('hidden');
+        document.getElementById('ccd-upload-area').classList.add('hidden');
+        document.getElementById('ccd-contacts-result').textContent = '';
+    }
+
+    async function addCallRecipientsFromContacts() {
+        if (!currentCallCampaignId) return;
+        const stage = document.getElementById('ccd-contact-stage').value;
+        const tagsStr = document.getElementById('ccd-contact-tags').value.trim();
+        const tags = tagsStr ? tagsStr.split(',').map(t => t.trim()).filter(Boolean) : [];
+        const resultEl = document.getElementById('ccd-contacts-result');
+        resultEl.textContent = 'Adding...';
+        resultEl.className = 'text-sm ml-2 text-gray-500';
+        try {
+            const data = await (await authFetch(`/api/call-campaigns/${currentCallCampaignId}/recipients-from-contacts`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stage, tags }),
+            })).json();
+            resultEl.textContent = data.message || `Added: ${data.added}, Duplicates: ${data.duplicate || 0}, Invalid: ${data.invalid || 0}`;
+            resultEl.className = 'text-sm ml-2 text-green-600';
+            openCallCampaign(currentCallCampaignId);
+        } catch (e) {
+            resultEl.textContent = 'Failed: ' + e.message;
+            resultEl.className = 'text-sm ml-2 text-red-600';
+        }
+    }
+
+    async function exportCallCampaignResults() {
+        if (!currentCallCampaignId) return;
+        try {
+            const results = (await (await authFetch(`/api/call-campaigns/${currentCallCampaignId}/results`)).json()).results || [];
+            if (!results.length) { alert('No results to export'); return; }
+            const headers = ['phone', 'name', 'status', 'attempts', 'last_attempt_at', 'duration_seconds', 'handoff_requested', 'hangup_reason', 'error_message', 'call_id'];
+            const csvCell = v => { v = v == null ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+            const rows = [headers.join(',')].concat(results.map(r => headers.map(h => csvCell(r[h])).join(',')));
+            const url = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' }));
+            const a = document.createElement('a');
+            a.href = url; a.download = `call_campaign_${currentCallCampaignId.substring(0, 8)}.csv`; a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Export failed: ' + e.message); }
+    }
+
+    // One-off AI call to a single contact (Contacts tab "AI Call" button)
+    async function callWithAI(btn) {
+        const phone = btn.dataset.phone, name = btn.dataset.name || '';
+        const purpose = prompt(`What should the AI call ${name || phone} about?`, '');
+        if (purpose === null) return;
+        if (!purpose.trim()) { alert('Please enter a purpose for the call.'); return; }
+        try {
+            await authFetch('/api/voicelink/call', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ to: phone, name, purpose: purpose.trim() }),
+            });
+            alert(`Calling ${name || phone} now. The call will appear in the Calls tab.`);
+        } catch (e) { if (e.message !== 'Unauthorized') alert('Call failed: ' + e.message); }
     }
 
     function showCampaignRecipientUpload() {

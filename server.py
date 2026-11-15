@@ -14,6 +14,7 @@ and posts call/chat summaries back to n8n for automation.
 
 import argparse
 import asyncio
+import hmac
 import os
 import re
 import secrets
@@ -35,6 +36,8 @@ from fastapi import (
     Header,
     HTTPException,
     Request,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,9 +45,14 @@ from loguru import logger
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.whatsapp.api import WhatsAppWebhookRequest
 from pipecat.transports.whatsapp.client import WhatsAppClient
+from voicelink.media.events import StartEvent, StopEvent, parse_message
+from voicelink.webhooks import parse_webhook
 
+import call_campaign_runner
 import media_storage
+import voicelink_client
 from bot import run_bot
+from voicelink_bot import end_live_call, run_voicelink_bot
 from chat_db import (
     get_conversation,
     get_conversation_messages,
@@ -53,9 +61,11 @@ from chat_db import (
     resolve_conversation,
     add_message,
     get_or_create_conversation,
+    update_conversation,
 )
 from chatbot import handle_text_message
 from contacts_db import (
+    get_or_create_contact,
     delete_contact,
     delete_contacts_bulk,
     export_contacts,
@@ -82,9 +92,35 @@ from campaign_db import (
     update_campaign,
 )
 from campaign_runner import is_campaign_running, request_pause, run_campaign
-from db import complete_call_record, delete_call, delete_calls_bulk, get_call, get_recent_calls, get_stats, init_db, resolve_call
-from knowledge import KNOWLEDGE_DIR, invalidate_cache as invalidate_knowledge_cache, load_knowledge
-from message_router import is_global_ai_enabled, route_webhook, set_global_ai_enabled
+from call_campaign_db import (
+    add_call_recipients,
+    create_call_campaign,
+    delete_call_campaign,
+    export_call_campaign_results,
+    get_call_campaign,
+    get_call_recipient_stats,
+    list_call_campaigns,
+    list_call_recipients,
+    reset_interrupted_recipients,
+    update_call_campaign,
+)
+from db import (
+    close_stale_active_calls,
+    complete_call_record,
+    delete_call,
+    delete_calls_bulk,
+    get_call,
+    get_recent_calls,
+    get_recent_voicelink_events,
+    get_stats,
+    init_db,
+    resolve_call,
+    save_voicelink_event,
+    update_call_by_voicelink_sid,
+)
+from knowledge import KNOWLEDGE_DIR, load_knowledge
+from message_router import route_webhook
+import push_notifications
 from orders import handle_razorpay_webhook
 from orders_db import get_order, get_order_stats, list_orders as list_orders_db
 from whatsapp_messaging import (
@@ -117,6 +153,8 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 GREETINGS_PASSWORD = os.getenv("GREETINGS_PASSWORD", "")
 ROOMS_PASSWORD = os.getenv("ROOMS_PASSWORD", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+# Dedicated service key for server-to-server callers (e.g. OneHub ERP).
+WA_API_KEY = os.getenv("WA_API_KEY", "")
 SESSION_EXPIRY_HOURS = 24
 
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "").lower() in ("production", "prod")
@@ -240,6 +278,33 @@ async def require_auth(
         token = authorization[7:]
         if secrets.compare_digest(token, DASHBOARD_PASSWORD):
             return
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def require_service_key(
+    session_token: str = Cookie(default=""),
+    authorization: str = Header(default=""),
+):
+    """Auth for server-to-server API clients (OneHub ERP). No CSRF.
+
+    Accepts, in order:
+    - Authorization: Bearer {WA_API_KEY}        (preferred dedicated key)
+    - Authorization: Bearer {DASHBOARD_PASSWORD} (fallback)
+    - a valid dashboard session cookie           (so the dashboard can call it)
+    """
+    if not DASHBOARD_PASSWORD and not WA_API_KEY:
+        return  # Auth disabled in dev mode
+
+    if authorization.startswith("Bearer "):
+        token = authorization[7:]
+        if WA_API_KEY and token == WA_API_KEY:
+            return
+        if DASHBOARD_PASSWORD and token == DASHBOARD_PASSWORD:
+            return
+
+    if verify_session(session_token):
+        return
 
     raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -414,12 +479,31 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await init_db()
 
+    # No call survives a restart: close out records left mid-call by the last one
+    await close_stale_active_calls()
+    await reset_interrupted_recipients()
+
     # Initialize MinIO bucket + lifecycle rules
     media_storage.init_bucket()
 
     # Load knowledge docs at startup
     knowledge_context = load_knowledge()
     logger.info(f"Knowledge loaded: {len(knowledge_context)} characters")
+
+    if voicelink_client.is_enabled():
+        logger.info(f"VoiceLink phone calling enabled for DID {voicelink_client.DID_NUMBER or '(VOICELINK_DID not set)'}")
+        # Call campaigns that were running before this restart/redeploy carry on.
+        await call_campaign_runner.resume_running_call_campaigns()
+    else:
+        logger.info("VoiceLink phone calling disabled (VOICELINK_URL_TOKEN not set)")
+
+    # Pre-generate the cached voice greeting so the very first call is instant
+    try:
+        import greeting_audio
+
+        await greeting_audio.prewarm()
+    except Exception as e:
+        logger.warning(f"Greeting prewarm skipped: {e}")
 
     async with aiohttp.ClientSession() as session:
         whatsapp_client = WhatsAppClient(
@@ -484,6 +568,47 @@ async def service_worker():
         media_type="application/javascript",
         headers={"Service-Worker-Allowed": "/"},
     )
+
+
+# --- Web Push notifications (Android PWA) ---
+
+@app.get("/api/push/vapid-public-key", dependencies=[Depends(require_auth)])
+async def push_vapid_public_key():
+    """Expose the VAPID public key so the dashboard can subscribe."""
+    return {"enabled": push_notifications.is_enabled(), "publicKey": push_notifications.get_public_key()}
+
+
+@app.post("/api/push/subscribe", dependencies=[Depends(require_auth_csrf)])
+async def push_subscribe(request: Request):
+    """Store a browser push subscription. Body: the PushSubscription JSON."""
+    try:
+        subscription = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    ok = await push_notifications.save_subscription(subscription)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid subscription (missing endpoint)")
+    return {"status": "subscribed"}
+
+
+@app.post("/api/push/unsubscribe", dependencies=[Depends(require_auth_csrf)])
+async def push_unsubscribe(request: Request):
+    """Remove a push subscription. Body: { "endpoint": "..." }"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    await push_notifications.delete_subscription(body.get("endpoint", ""))
+    return {"status": "unsubscribed"}
+
+
+@app.post("/api/push/test", dependencies=[Depends(require_auth_csrf)])
+async def push_test():
+    """Send a test notification to all subscribed devices."""
+    count = await push_notifications.send_to_all(
+        "Test notification", "Push notifications are working ✅", tag="test"
+    )
+    return {"status": "sent", "delivered": count}
 
 
 @app.get("/api/branding")
@@ -624,7 +749,7 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
     if body.object != "whatsapp_business_account":
         raise HTTPException(status_code=400, detail="Invalid object type")
 
-    logger.info(f"Webhook received: {body.dict()}")
+    logger.info(f"Webhook received: {body.model_dump()}")
 
     # Extract caller info from webhook payload
     caller_phone = ""
@@ -671,6 +796,346 @@ async def handle_webhook(body: WhatsAppWebhookRequest, background_tasks: Backgro
     except Exception as e:
         logger.error(f"Webhook processing error: {e}")
         raise HTTPException(status_code=500, detail="Internal error")
+
+
+# --- VoiceLink Phone Calls (Indian number) ---
+# VoiceLink doesn't sign media connections or webhooks, so both URLs carry
+# VOICELINK_URL_TOKEN as an unguessable path segment. Unset token = disabled.
+
+VOICELINK_START_TIMEOUT_SECS = 15
+# Fire-and-forget tasks started from webhooks; referenced so they aren't GC'd.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _voicelink_token_ok(token: str) -> bool:
+    return voicelink_client.is_enabled() and hmac.compare_digest(token, voicelink_client.URL_TOKEN)
+
+
+@app.websocket("/voicelink/ws/{token}")
+async def voicelink_media_stream(websocket: WebSocket, token: str):
+    """VoiceLink streams each phone call's audio here (inbound and outbound)."""
+    if not _voicelink_token_ok(token):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    logger.info("VoiceLink media stream connected")
+
+    # Read until "start": the docs promise a "connected" frame first, but in
+    # practice VoiceLink often sends "start" straight away. VoiceLink also probes
+    # reachability by opening a socket and closing it without sending anything.
+    # Frames may arrive as text or binary, so accept both (like Pipecat does).
+    try:
+        start, start_raw, frames_seen = None, None, 0
+        async with asyncio.timeout(VOICELINK_START_TIMEOUT_SECS):
+            while start is None:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+                raw = message.get("text")
+                if raw is None and message.get("bytes") is not None:
+                    raw = message["bytes"].decode("utf-8", errors="replace")
+                if not raw:
+                    continue
+                frames_seen += 1
+                if frames_seen <= 3:
+                    logger.info(f"VoiceLink frame before start: {raw[:300]}")
+                try:
+                    event = parse_message(raw)
+                except ValueError as e:
+                    logger.warning(f"Skipping unparseable VoiceLink frame: {e}")
+                    continue
+                if isinstance(event, StartEvent):
+                    start, start_raw = event, raw
+                elif isinstance(event, StopEvent):
+                    logger.info("VoiceLink stream stopped before start")
+                    return
+    except WebSocketDisconnect:
+        logger.info("VoiceLink connection closed before start (reachability probe if no frames)")
+        return
+    except TimeoutError:
+        logger.warning(f"VoiceLink sent no start event within {VOICELINK_START_TIMEOUT_SECS}s, closing")
+        await websocket.close()
+        return
+
+    try:
+        await run_voicelink_bot(websocket, start, start_raw)
+    except Exception:
+        logger.exception(f"VoiceLink call {start.call_sid} crashed")
+
+
+def _find_recording_url(payload: dict) -> str:
+    """VoiceLink's recording URL key isn't documented consistently; look anywhere."""
+    stack = [payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if "recording" in k.lower() and isinstance(v, str) and v.startswith("http"):
+                    return v
+                stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return ""
+
+
+@app.post("/voicelink/webhook/{token}")
+async def voicelink_webhook(token: str, request: Request):
+    """VoiceLink call-lifecycle events. Always 200, or VoiceLink retries."""
+    if not _voicelink_token_ok(token):
+        raise HTTPException(status_code=404)
+    try:
+        event = parse_webhook(await request.body())
+    except ValueError as e:
+        logger.warning(f"Unparseable VoiceLink webhook: {e}")
+        return {"status": "ignored"}
+
+    name = getattr(event.event, "value", event.event)
+    call = event.call
+    logger.info(
+        f"VoiceLink webhook {name}: call={call.id} {call.direction} "
+        f"{call.from_number}->{call.to_number} status={call.status or call.call_status} "
+        f"duration={call.duration_sec}"
+    )
+    try:
+        await save_voicelink_event(str(name), call.id, call.outbound_queue_id, event.raw)
+        fields = {}
+        recording_url = _find_recording_url(event.raw)
+        if recording_url:
+            fields["voicelink_recording_url"] = recording_url
+        if call.hangup_reason or call.hangup_cause:
+            fields["hangup_reason"] = call.hangup_reason or str(call.hangup_cause)
+        if fields:
+            await update_call_by_voicelink_sid(call.id, **fields)
+        # Close out campaign calls that ended without being answered
+        await call_campaign_runner.handle_voicelink_webhook(str(name), call)
+        # If our AI session for this call is somehow still open, end and save it.
+        # Runs in the background: it waits a few seconds and VoiceLink needs its 200 now.
+        if str(name) in ("call.ended", "call.completed", "call.failed"):
+            task = asyncio.create_task(
+                end_live_call(call.id, [call.from_number or "", call.to_number or ""])
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+    except Exception as e:
+        logger.error(f"Failed to store VoiceLink webhook: {e}")
+    return {"status": "ok"}
+
+
+@app.post("/api/voicelink/call", dependencies=[Depends(require_service_key)])
+async def voicelink_place_call(request: Request):
+    """Place an outbound AI phone call from the VoiceLink number.
+
+    Auth: Authorization: Bearer <WA_API_KEY> (or a dashboard session).
+
+    Body: {
+        "to": "9812345678",               # required; 10-digit, 91…, or +91…
+        "name": "Asha",                    # optional, the AI greets them by name
+        "purpose": "follow up on her MBA enquiry",  # optional, what the AI calls about
+        "custom_parameters": {...}         # optional, stored with the call
+    }
+    Returns: { "status": "queued", "outbound_queue_id": 123 }
+
+    Dials a real phone and uses VoiceLink wallet balance.
+    """
+    if not voicelink_client.is_enabled() or not voicelink_client.DID_NUMBER:
+        raise HTTPException(status_code=503, detail="VoiceLink calling is not configured")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    to = str(body.get("to") or "").strip()
+    if not to:
+        raise HTTPException(status_code=400, detail="'to' is required")
+    extra = body.get("custom_parameters") or {}
+    if not isinstance(extra, dict):
+        raise HTTPException(status_code=400, detail="'custom_parameters' must be an object")
+    params = {
+        **extra,
+        "direction": "outbound",
+        "name": str(body.get("name") or ""),
+        "purpose": str(body.get("purpose") or ""),
+    }
+    try:
+        # The SDK is synchronous (httpx) — keep it off the event loop.
+        queue_id = await asyncio.to_thread(voicelink_client.place_call, to, params)
+    except Exception as e:
+        logger.error(f"VoiceLink add_lead failed for {to}: {e}")
+        raise HTTPException(status_code=502, detail=f"VoiceLink error: {e}")
+    logger.info(f"VoiceLink outbound call to {to} queued (queue id {queue_id})")
+    return {"status": "queued", "outbound_queue_id": queue_id}
+
+
+@app.get("/api/voicelink/events", dependencies=[Depends(require_auth)])
+async def voicelink_events(limit: int = 50):
+    """Raw VoiceLink webhooks, newest first (for debugging the payload shape)."""
+    return {"events": await get_recent_voicelink_events(limit)}
+
+
+# --- Protected: AI Call Campaigns (VoiceLink outbound) ---
+
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _call_campaign_fields(body: dict, partial: bool) -> dict:
+    """Validate call-campaign fields from a request body."""
+    fields = {}
+    for key in ("name", "purpose", "brief", "followup_template"):
+        if key in body:
+            fields[key] = str(body.get(key) or "").strip()
+    for key, lo, hi in (("max_attempts", 1, 5), ("retry_gap_minutes", 5, 24 * 60)):
+        if key in body:
+            try:
+                value = int(body[key])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"{key} must be a number")
+            fields[key] = max(lo, min(hi, value))
+    for key in ("call_window_start", "call_window_end"):
+        if key in body:
+            value = str(body[key] or "").strip()
+            if not _HHMM.match(value):
+                raise HTTPException(status_code=400, detail=f"{key} must be HH:MM (24h)")
+            fields[key] = value
+    if not partial and (not fields.get("name") or not fields.get("purpose")):
+        raise HTTPException(status_code=400, detail="name and purpose are required")
+    if "name" in fields and not fields["name"]:
+        raise HTTPException(status_code=400, detail="name cannot be empty")
+    if "purpose" in fields and not fields["purpose"]:
+        raise HTTPException(status_code=400, detail="purpose cannot be empty")
+    return fields
+
+
+async def _get_call_campaign_or_404(campaign_id: str) -> dict:
+    campaign = await get_call_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Call campaign not found")
+    return campaign
+
+
+@app.get("/api/call-campaigns", dependencies=[Depends(require_auth)])
+async def api_list_call_campaigns(status: str = "", limit: int = 100):
+    return {"campaigns": await list_call_campaigns(limit=limit, status=status)}
+
+
+@app.post("/api/call-campaigns", dependencies=[Depends(require_auth_csrf)])
+async def api_create_call_campaign(request: Request):
+    """Create an AI call campaign (draft).
+
+    Body: {
+        "name": "Alumni Meet 2026",
+        "purpose": "invite them to the alumni meet on 15 Nov",   # what the AI calls about
+        "brief": "Date, venue, agenda, how to register ...",      # details the AI can use
+        "followup_template": "alumni_meet_details",               # optional WhatsApp template
+        "max_attempts": 2, "retry_gap_minutes": 60,
+        "call_window_start": "10:00", "call_window_end": "19:00"  # IST
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    return await create_call_campaign(**_call_campaign_fields(body, partial=False))
+
+
+@app.get("/api/call-campaigns/{campaign_id}", dependencies=[Depends(require_auth)])
+async def api_get_call_campaign(campaign_id: str):
+    campaign = await _get_call_campaign_or_404(campaign_id)
+    campaign["recipient_stats"] = await get_call_recipient_stats(campaign_id)
+    campaign["is_running"] = call_campaign_runner.is_call_campaign_running(campaign_id)
+    return campaign
+
+
+@app.patch("/api/call-campaigns/{campaign_id}", dependencies=[Depends(require_auth_csrf)])
+async def api_update_call_campaign(campaign_id: str, request: Request):
+    """Edit a campaign. Allowed while running too — changes apply from the next call."""
+    await _get_call_campaign_or_404(campaign_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    fields = _call_campaign_fields(body, partial=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    return await update_call_campaign(campaign_id, **fields)
+
+
+@app.delete("/api/call-campaigns/{campaign_id}", dependencies=[Depends(require_auth_csrf)])
+async def api_delete_call_campaign(campaign_id: str):
+    try:
+        deleted = await delete_call_campaign(campaign_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Call campaign not found")
+    return {"success": True}
+
+
+@app.post("/api/call-campaigns/{campaign_id}/recipients", dependencies=[Depends(require_auth_csrf)])
+async def api_add_call_recipients(campaign_id: str, request: Request):
+    """Body: { "recipients": [ {"phone": "9812345678", "name": "Asha"}, ... ] }"""
+    await _get_call_campaign_or_404(campaign_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    records = body.get("recipients") or []
+    if not isinstance(records, list):
+        raise HTTPException(status_code=400, detail="'recipients' must be an array")
+    return await add_call_recipients(campaign_id, records)
+
+
+@app.post("/api/call-campaigns/{campaign_id}/recipients-from-contacts", dependencies=[Depends(require_auth_csrf)])
+async def api_add_call_recipients_from_contacts(campaign_id: str, request: Request):
+    """Body: { "stage": "interested", "tags": ["alumni"] } — both optional."""
+    await _get_call_campaign_or_404(campaign_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    records = await _contacts_matching(body.get("stage", ""), body.get("tags", []))
+    if not records:
+        return {"added": 0, "duplicate": 0, "invalid": 0, "message": "No matching contacts found"}
+    return await add_call_recipients(campaign_id, records)
+
+
+@app.get("/api/call-campaigns/{campaign_id}/recipients", dependencies=[Depends(require_auth)])
+async def api_list_call_recipients(campaign_id: str, limit: int = 200, offset: int = 0):
+    await _get_call_campaign_or_404(campaign_id)
+    return {"recipients": await list_call_recipients(campaign_id, limit=limit, offset=offset)}
+
+
+@app.post("/api/call-campaigns/{campaign_id}/start", dependencies=[Depends(require_auth_csrf)])
+async def api_start_call_campaign(campaign_id: str):
+    """Start or resume calling. Calls go out one at a time, within call hours."""
+    if not voicelink_client.is_enabled() or not voicelink_client.DID_NUMBER:
+        raise HTTPException(status_code=503, detail="VoiceLink calling is not configured")
+    campaign = await _get_call_campaign_or_404(campaign_id)
+    if call_campaign_runner.is_call_campaign_running(campaign_id):
+        raise HTTPException(status_code=400, detail="Campaign is already running")
+    # 'running' here means the runner died (it isn't in memory); 'completed' can be
+    # restarted after adding more recipients.
+    if campaign["status"] not in ("draft", "paused", "running", "completed"):
+        raise HTTPException(status_code=400, detail=f"Cannot start a {campaign['status']} campaign")
+    stats = await get_call_recipient_stats(campaign_id)
+    if not stats["total"]:
+        raise HTTPException(status_code=400, detail="Add recipients before starting")
+    call_campaign_runner.start_call_campaign_task(campaign_id)
+    return {"status": "running", "campaign_id": campaign_id}
+
+
+@app.post("/api/call-campaigns/{campaign_id}/pause", dependencies=[Depends(require_auth_csrf)])
+async def api_pause_call_campaign(campaign_id: str):
+    """Pause after the call in progress (if any) finishes."""
+    await _get_call_campaign_or_404(campaign_id)
+    if not call_campaign_runner.is_call_campaign_running(campaign_id):
+        raise HTTPException(status_code=400, detail="Campaign is not running")
+    call_campaign_runner.request_call_campaign_pause(campaign_id)
+    return {"status": "pausing", "campaign_id": campaign_id}
+
+
+@app.get("/api/call-campaigns/{campaign_id}/results", dependencies=[Depends(require_auth)])
+async def api_export_call_campaign(campaign_id: str):
+    await _get_call_campaign_or_404(campaign_id)
+    return {"results": await export_call_campaign_results(campaign_id)}
 
 
 # --- WhatsApp Text Message Webhook (validated by secret, not session auth) ---
@@ -930,6 +1395,120 @@ async def send_direct_message(request: Request):
         "phone": phone,
         "conversation_id": conv["id"],
     }
+
+
+def _normalize_phone(raw: str) -> str:
+    """Strip '+' and any non-digit characters (E.164 → digits-only)."""
+    return "".join(ch for ch in (raw or "") if ch.isdigit())
+
+
+def _build_template_components(params: list, buttons: list) -> list:
+    """Build WhatsApp template `components` from a flat param array + buttons.
+
+    params  -> one body component with positional {type:text} parameters.
+    buttons -> one button component each (used by authentication_otp: a URL
+               button carrying the OTP code at index 0).
+    """
+    components = []
+    if params:
+        components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(p)} for p in params],
+        })
+    for btn in buttons or []:
+        components.append({
+            "type": "button",
+            "sub_type": btn.get("type", "url"),
+            "index": str(btn.get("index", 0)),
+            "parameters": [{"type": "text", "text": str(btn.get("param", ""))}],
+        })
+    return components
+
+
+def _template_preview(template_name: str, params: list) -> str:
+    """A short human-readable line stored in conversation history for AI context."""
+    readable = template_name.replace("onehub_", "").replace("_", " ").strip() or template_name
+    if params:
+        return f"[{readable}] " + " · ".join(str(p) for p in params)
+    return f"[{readable}]"
+
+
+@app.post("/api/whatsapp/send", dependencies=[Depends(require_service_key)])
+async def whatsapp_send(request: Request):
+    """Send an approved WhatsApp template on behalf of an external system (OneHub).
+
+    Drop-in replacement for calling the Meta Cloud API directly: it sends the
+    template AND records it into the contact's conversation, so when the student
+    replies the AI / inbox has full context.
+
+    Auth: Authorization: Bearer <WA_API_KEY>
+
+    Body: {
+        "to": "+919812345678",                 # required (any format; normalised to digits)
+        "template": "onehub_webinar_confirmation",  # required, approved template name
+        "language": "en",                      # optional, default "en"
+        "params": ["Asha", "MS Fabric 101", "https://..."],  # ordered body {{1}},{{2}}...
+        "buttons": [ {"type": "url", "index": 0, "param": "483920"} ],  # OTP only
+        "context": { "source": "confirm-webinar-payment", "user_id": "..." },  # for logging
+        "name": "Asha",                        # optional, improves the CRM contact name
+        "ai_reply": true                        # optional, default true. false = send the
+                                                #   reply to the human inbox (use for
+                                                #   admin-targeted alerts / one-way blasts).
+    }
+    Returns: { "message_id": "wamid...", "status": "sent" }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    to_raw = body.get("to", "")
+    template_name = (body.get("template") or "").strip()
+    language = (body.get("language") or "en").strip() or "en"
+    params = body.get("params") or []
+    buttons = body.get("buttons") or []
+    context = body.get("context") or {}
+    name = (body.get("name") or "").strip()
+    ai_reply = bool(body.get("ai_reply", True))
+
+    phone = _normalize_phone(to_raw)
+    if not phone or not template_name:
+        raise HTTPException(status_code=400, detail="'to' and 'template' are required")
+    if not isinstance(params, list) or not isinstance(buttons, list):
+        raise HTTPException(status_code=400, detail="'params' and 'buttons' must be arrays")
+
+    # Send the template via the Cloud API
+    components = _build_template_components(params, buttons)
+    result = await send_whatsapp_template(
+        to_phone=phone,
+        template_name=template_name,
+        language=language,
+        components=components or None,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("error", "Template send failed"))
+    wa_message_id = result.get("wa_message_id", "")
+
+    # Record for context (best-effort — never fail the send because logging hiccuped)
+    try:
+        contact = await get_or_create_contact(phone, name)
+        conv = await get_or_create_conversation(phone, name, contact["id"])
+        await add_message(
+            conv["id"], "assistant", _template_preview(template_name, params),
+            wa_message_id=wa_message_id, direction="outbound", source="erp",
+        )
+        # Tag the conversation so the AI replies in-context (template name → context).
+        await update_conversation(conv["id"], campaign=template_name)
+        if not ai_reply:
+            await toggle_ai(contact["id"], False)
+    except Exception as e:
+        logger.warning(f"whatsapp_send: context logging failed for {phone}: {e}")
+
+    logger.info(
+        f"OneHub send: {template_name} → {phone} "
+        f"[src={context.get('source', '')}, wamid={wa_message_id}, ai_reply={ai_reply}]"
+    )
+    return {"message_id": wa_message_id, "status": "sent"}
 
 
 @app.post("/api/messages/send-template", dependencies=[Depends(require_auth_csrf)])
@@ -1335,13 +1914,18 @@ async def api_add_recipients_from_contacts(campaign_id: str, request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    stage = body.get("stage", "")
-    tags = body.get("tags", [])
+    records = await _contacts_matching(body.get("stage", ""), body.get("tags", []))
+    if not records:
+        return {"added": 0, "duplicate": 0, "invalid": 0, "message": "No matching contacts found"}
 
-    # Fetch contacts matching criteria
+    result = await add_recipients(campaign_id, records)
+    return result
+
+
+async def _contacts_matching(stage: str, tags: list) -> list[dict]:
+    """CRM contacts filtered by stage and/or tags, as campaign recipient records."""
     contacts = await list_contacts(limit=10000, stage=stage)
 
-    # Filter by tags if specified
     if tags:
         tag_set = {t.lower().strip() for t in tags}
         filtered = []
@@ -1357,12 +1941,7 @@ async def api_add_recipients_from_contacts(campaign_id: str, request: Request):
                 filtered.append(c)
         contacts = filtered
 
-    if not contacts:
-        return {"added": 0, "duplicate": 0, "invalid": 0, "message": "No matching contacts found"}
-
-    records = [{"phone": c["phone"], "name": c.get("name", "")} for c in contacts if c.get("phone")]
-    result = await add_recipients(campaign_id, records)
-    return result
+    return [{"phone": c["phone"], "name": c.get("name", "")} for c in contacts if c.get("phone")]
 
 
 # --- Protected: Orders API ---

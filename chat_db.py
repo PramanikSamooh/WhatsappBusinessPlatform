@@ -36,6 +36,7 @@ async def init_chat_tables():
                 handoff_requested INTEGER DEFAULT 0,
                 handoff_reason  TEXT DEFAULT '',
                 topics          TEXT DEFAULT '[]',
+                campaign        TEXT DEFAULT '',
                 message_count   INTEGER DEFAULT 0,
                 created_at      TEXT DEFAULT (datetime('now'))
             )
@@ -167,7 +168,7 @@ async def get_recent_messages(conversation_id: str, limit: int = 10) -> list[dic
 
 _CONVERSATION_ALLOWED_COLUMNS = {
     "phone", "name", "contact_id", "last_message_at", "status",
-    "handoff_requested", "handoff_reason", "topics", "message_count",
+    "handoff_requested", "handoff_reason", "topics", "campaign", "message_count",
 }
 
 
