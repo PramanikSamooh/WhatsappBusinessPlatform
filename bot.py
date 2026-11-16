@@ -603,6 +603,7 @@ async def run_bot(
             try:
                 if await is_blocked(caller_phone):
                     logger.info(f"Call {call_id}: BLOCKED caller {caller_phone}, disconnecting")
+                    call_metadata["blocked"] = True
                     await task.queue_frame(EndFrame())
                     return
             except Exception as e:
@@ -622,7 +623,7 @@ async def run_bot(
             )
         else:
             # No cached clip — fall back to a dynamic Gemini-generated greeting.
-            logger.info(f"Call {call_id}: triggering dynamic Gemini greeting (no cached clip)")
+            logger.info(f"Call {call_id}: triggering dynamic AI greeting (no cached clip)")
             await task.queue_frames([LLMRunFrame()])
 
         # Housekeeping — runs after greeting is already queued
@@ -647,4 +648,14 @@ async def run_bot(
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        # Runs however the call ended. When the AI hangs up (end_call), the
+        # EndFrame stops the pipeline and cancels handle_end_call's fallback,
+        # and on_client_disconnected doesn't fire for a hang-up from our side,
+        # so without this the call was never saved. No-op if already finalized;
+        # skipped for blocked callers and calls that never connected (no record,
+        # and they must not get a follow-up message).
+        if call_metadata["connected_at"] and not call_metadata.get("blocked"):
+            await finalize_call()
