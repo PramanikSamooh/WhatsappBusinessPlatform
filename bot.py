@@ -240,7 +240,7 @@ def build_voice_services(system_instruction: str, greet_on_connect: bool = True)
     if VOICE_ENGINE != "sarvam":
         llm = GeminiLiveLLMService(
             api_key=os.getenv("GOOGLE_API_KEY"),
-            voice_id="Kore",  # Options: Aoede, Charon, Fenrir, Kore, Puck
+            voice_id=os.getenv("VOICE_ID", "Kore"),  # Aoede, Charon, Fenrir, Kore, Puck
             system_instruction=system_instruction,
             params=_build_gemini_params(),
             inference_on_context_initialization=greet_on_connect,
@@ -412,7 +412,10 @@ async def run_bot(
         initial_messages = [
             {
                 "role": "user",
-                "content": f"A customer is calling {_BUSINESS_SHORT or _BUSINESS_NAME}. Greet them briefly.",
+                "content": os.getenv(
+                    "VOICE_GREETING",
+                    f"A customer is calling {_BUSINESS_SHORT or _BUSINESS_NAME}. Greet them briefly.",
+                ),
             }
         ]
     context = LLMContext(initial_messages, tools=_tools)
